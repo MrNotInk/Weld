@@ -24,8 +24,7 @@ A fast, lightweight Python application packaging and distribution tool designed 
 Weld requires **Python 3.11+** (or standard Python with `tomli`).
 
 ### Python Dependencies
-Python Should Be 3.14< becuase nuitka support only this right now check via```
-python --version```
+Python Should Be 3.14< becuase nuitka support only this right now check via```python --version```
 Install the required packages using pip:
 ```bash
 pip install rich tomli-w cython nuitka pyinstaller ruff
