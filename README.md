@@ -29,3 +29,5 @@ Install the required packages using pip:
 ```bash
 pip install rich tomli-w cython nuitka pyinstaller ruff
 ```
+### Verify
+Check if everything is okay using ```weld --doctor``` 
