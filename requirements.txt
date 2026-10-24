@@ -1,0 +1,27 @@
+# weld runtime dependencies
+#
+# Python 3.11+ is required (the standard library's tomllib is used when
+# available; tomli is installed automatically on older interpreters).
+#
+# Install with:
+#     python -m pip install -r requirements.txt
+
+# --- core -----------------------------------------------------------------
+rich>=13.0.0
+tomli-w>=1.0.0
+tomli>=2.0.0; python_version < "3.11"
+
+# --- code validation ------------------------------------------------------
+ruff>=0.5.0
+
+# --- compilation engines --------------------------------------------------
+# At least one of nuitka / pyinstaller is required to install packages.
+# Cython + setuptools are required for packages that ship bin/libs/*.py.
+cython>=3.0.0
+setuptools>=68.0.0
+nuitka>=2.4; python_version < "3.14"
+pyinstaller>=6.0; python_version < "3.14"
+
+# Note: Nuitka and PyInstaller do not support every Python release on day
+# one.  If you are on a very new Python version, install a compiler release
+# that supports it manually, or use Python 3.11-3.13.

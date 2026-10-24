@@ -1,0 +1,13 @@
+# Development / test dependencies for weld
+#
+# The test-suite only needs the core runtime, ruff (used by `weld --build`)
+# and pytest.  The real compilers are replaced by fakes during tests.
+#
+#     python -m pip install -r requirements-dev.txt
+#     python -m pytest
+
+rich>=13.0.0
+tomli-w>=1.0.0
+tomli>=2.0.0; python_version < "3.11"
+ruff>=0.5.0
+pytest>=8.0.0

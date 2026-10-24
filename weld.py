@@ -1,26 +1,34 @@
 import argparse
-import os
+import copy
+import fnmatch
+import glob
+import importlib.util
 import json
-import sys
-import re
-import shutil
-import subprocess
+import os
 import py_compile
+import re
+import shlex
+import shutil
+import stat
+import subprocess
+import sys
+import tempfile
 import threading
 import time
-import fnmatch
-import tempfile
-import importlib.util
-import copy
-import fcntl
-import atexit
+import zipfile
 from collections import defaultdict
-from datetime import datetime
 from contextlib import contextmanager
-from rich.console import Console
+from datetime import datetime
+
 from rich.box import ROUNDED
+from rich.console import Console
+from rich.markup import escape as _esc
 from rich.table import Table
-import glob
+
+try:
+    import fcntl
+except ImportError:  # pragma: no cover - Windows has no fcntl
+    fcntl = None  # type: ignore[assignment]
 
 try:
     import tomllib
@@ -67,21 +75,62 @@ DEFAULT_CONFIG = {
     }
 }
 
+# Directory names that are never archived (VCS data, caches, virtualenvs, ...)
+_ARCHIVE_EXCLUDE_DIRS = {
+    ".git", ".hg", ".svn", ".idea", ".vscode",
+    ".venv", "venv", "env", "ENV",
+    "__pycache__", ".mypy_cache", ".ruff_cache", ".pytest_cache",
+    "node_modules", "build", "dist", "_pyibuild",
+}
+
+# File suffixes that are never archived (build leftovers, backups, ...)
+_ARCHIVE_EXCLUDE_SUFFIXES = (".pyc", ".pyo", ".bak", ".spec", ".wld")
+
+# Files created by tools that must never be copied into ~/.weld/bin
+_INSTALL_JUNK_SUFFIXES = (".pyc", ".pyo", ".bak", ".spec", ".c", ".build", ".dist")
+_INSTALL_JUNK_NAMES = {"__pycache__", ".DS_Store", "Thumbs.db"}
+
+# Package names that would collide with weld's own layout inside ~/.weld/bin
+_RESERVED_PKG_NAMES = {"libs"}
+
+_MAX_ARCHIVE_ENTRIES = 10_000
+_MAX_ARCHIVE_BYTES = 1 << 30  # 1 GiB uncompressed
+
+_TEMPLATE_NAME_RE = re.compile(r"^[A-Za-z0-9_\-]+$")
+_PKG_NAME_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_\-]*$")
+
+
 # ---------------------------------------------------------------------------
 # Package-name validation
 # ---------------------------------------------------------------------------
 
-_PKG_NAME_RE = re.compile(r'^[a-zA-Z0-9_\-]+$')
-
-
 def _validate_pkg_name(name: str) -> None:
-    """Raise SystemExit if *name* contains unsafe characters."""
-    if not _PKG_NAME_RE.match(name):
+    """Raise SystemExit if *name* is empty or contains unsafe characters."""
+    if not isinstance(name, str) or not _PKG_NAME_RE.match(name):
         console.print(
-            f"[red]Error:[/red] Invalid package name '{name}'. "
+            f"[red]Error:[/red] Invalid package name '{_esc(name)}'. "
+            "Only letters, digits, hyphens and underscores are allowed, "
+            "and the name must start with a letter or digit."
+        )
+        raise SystemExit(1)
+    if name.lower() in _RESERVED_PKG_NAMES:
+        console.print(
+            f"[red]Error:[/red] The package name '{_esc(name)}' is reserved by weld."
+        )
+        raise SystemExit(1)
+
+
+def _validate_template_name(name: str) -> None:
+    if not isinstance(name, str) or not _TEMPLATE_NAME_RE.match(name):
+        console.print(
+            f"[red]Error:[/red] Invalid template name '{_esc(name)}'. "
             "Only letters, digits, hyphens and underscores are allowed."
         )
         raise SystemExit(1)
+
+
+def _is_junk_name(name: str) -> bool:
+    return name in _INSTALL_JUNK_NAMES or name.endswith(_INSTALL_JUNK_SUFFIXES)
 
 
 # ---------------------------------------------------------------------------
@@ -233,10 +282,10 @@ TEMPLATES["daemon"] = {
 """
 Background daemon / service template.
 """
-import signal
-import time
-import sys
 import logging
+import signal
+import sys
+import time
 
 logging.basicConfig(
     level=logging.INFO,
@@ -282,6 +331,7 @@ TEMPLATES["scraper"] = {
 Web scraper template.
 """
 import sys
+
 import requests
 from bs4 import BeautifulSoup
 
@@ -307,7 +357,7 @@ def main() -> int:
     html  = fetch(url)
     items = parse(html)
     for item in items:
-        print(f"{item[\'text\']!r:40}  {item[\'href\']}")
+        print(f"{item['text']!r:40}  {item['href']}")
     return 0
 
 
@@ -324,11 +374,12 @@ Terminal UI template.
 """
 import sys
 import time
+
 from rich.console import Console
-from rich.table import Table
+from rich.live import Live
 from rich.panel import Panel
 from rich.prompt import Prompt
-from rich.live import Live
+from rich.table import Table
 
 console = Console()
 
@@ -378,10 +429,14 @@ Telegram bot template.
 """
 import logging
 import sys
+
 from telegram import Update
 from telegram.ext import (
-    Application, CommandHandler,
-    MessageHandler, filters, ContextTypes,
+    Application,
+    CommandHandler,
+    ContextTypes,
+    MessageHandler,
+    filters,
 )
 
 logging.basicConfig(level=logging.INFO)
@@ -422,10 +477,11 @@ TEMPLATES["cron"] = {
 """
 Scheduled task / cron template.
 """
-import schedule
-import time
 import logging
 import sys
+import time
+
+import schedule
 
 logging.basicConfig(
     level=logging.INFO,
@@ -467,9 +523,9 @@ TEMPLATES["tcp_server"] = {
 """
 TCP socket server template.
 """
+import logging
 import socketserver
 import sys
-import logging
 
 logging.basicConfig(level=logging.INFO)
 log = logging.getLogger(__name__)
@@ -504,10 +560,11 @@ TEMPLATES["grpc"] = {
 """
 gRPC server template.
 """
-import sys
 import logging
-import grpc
+import sys
 from concurrent.futures import ThreadPoolExecutor
+
+import grpc
 
 logging.basicConfig(level=logging.INFO)
 log = logging.getLogger(__name__)
@@ -537,9 +594,9 @@ TEMPLATES["data_pipeline"] = {
 """
 Data pipeline template.
 """
-import sys
 import json
 import logging
+import sys
 from pathlib import Path
 
 logging.basicConfig(level=logging.INFO)
@@ -580,8 +637,9 @@ TEMPLATES["rest_client"] = {
 """
 REST API client template.
 """
-import sys
 import json
+import sys
+
 import requests
 
 BASE_URL = "https://jsonplaceholder.typicode.com"
@@ -594,7 +652,7 @@ class APIClient:
 
     def get(self, path: str, **params) -> dict:
         r = self.session.get(
-            f"{self.base_url}/{path.lstrip(\'/\')}",
+            f"{self.base_url}/{path.lstrip('/')}",
             params=params, timeout=10,
         )
         r.raise_for_status()
@@ -602,7 +660,7 @@ class APIClient:
 
     def post(self, path: str, data: dict) -> dict:
         r = self.session.post(
-            f"{self.base_url}/{path.lstrip(\'/\')}",
+            f"{self.base_url}/{path.lstrip('/')}",
             json=data, timeout=10,
         )
         r.raise_for_status()
@@ -610,7 +668,7 @@ class APIClient:
 
     def delete(self, path: str) -> int:
         r = self.session.delete(
-            f"{self.base_url}/{path.lstrip(\'/\')}",
+            f"{self.base_url}/{path.lstrip('/')}",
             timeout=10,
         )
         r.raise_for_status()
@@ -635,8 +693,9 @@ TEMPLATES["config_app"] = {
 """
 Config-file driven application template.
 """
-import sys
 import os
+import sys
+
 try:
     import tomllib
 except ImportError:
@@ -660,9 +719,9 @@ def load_config() -> dict:
 def main() -> int:
     cfg = load_config()
     app = cfg.get("app", {})
-    print(f"App:     {app.get(\'name\', \'unknown\')}")
-    print(f"Debug:   {app.get(\'debug\', False)}")
-    print(f"Workers: {app.get(\'workers\', 1)}")
+    print(f"App:     {app.get('name', 'unknown')}")
+    print(f"Debug:   {app.get('debug', False)}")
+    print(f"Workers: {app.get('workers', 1)}")
     return 0
 
 
@@ -749,6 +808,249 @@ def _progress_done() -> None:
 
 
 # ---------------------------------------------------------------------------
+# Filesystem / archive helpers
+# ---------------------------------------------------------------------------
+
+def _atomic_write(path: str, data: str | bytes) -> None:
+    """Write *data* to *path* atomically (temp file + rename)."""
+    directory = os.path.dirname(os.path.abspath(path))
+    os.makedirs(directory, exist_ok=True)
+    tmp = f"{path}.tmp.{os.getpid()}"
+    try:
+        if isinstance(data, bytes):
+            with open(tmp, "wb") as fp:
+                fp.write(data)
+                fp.flush()
+                os.fsync(fp.fileno())
+        else:
+            with open(tmp, "w", encoding="utf-8") as fp:
+                fp.write(data)
+                fp.flush()
+                os.fsync(fp.fileno())
+        os.replace(tmp, path)
+    finally:
+        if os.path.exists(tmp):
+            os.remove(tmp)
+
+
+def _write_json(path: str, data: dict) -> None:
+    _atomic_write(path, json.dumps(data, indent=4) + "\n")
+
+
+def _safe_join(base: str, relative: str) -> str | None:
+    """Join *relative* onto *base*, returning None if it escapes *base*."""
+    if not isinstance(relative, str) or not relative:
+        return None
+    base_abs = os.path.abspath(base)
+    target = os.path.abspath(os.path.join(base_abs, relative))
+    try:
+        if os.path.commonpath([base_abs, target]) != base_abs:
+            return None
+    except ValueError:  # different drives on Windows
+        return None
+    return target
+
+
+def _prune_empty_dirs(base: str, relative: str) -> None:
+    """Remove now-empty parent directories of *relative* below *base*."""
+    base_abs = os.path.abspath(base)
+    parent = os.path.dirname(os.path.abspath(os.path.join(base_abs, relative)))
+    while parent != base_abs and parent.startswith(base_abs + os.sep):
+        try:
+            os.rmdir(parent)
+        except OSError:
+            break
+        parent = os.path.dirname(parent)
+
+
+def _require_tool(tool: str, hint: str = "") -> str:
+    path = shutil.which(tool)
+    if not path:
+        console.print(f"[red]Error:[/red] Required tool '{_esc(tool)}' not found on PATH.")
+        if hint:
+            _print(f"{_DIM}{hint}{_RESET}")
+        raise SystemExit(1)
+    return path
+
+
+def _normalize_config(raw: object, source: str) -> dict:
+    """Validate a project/archive config dict and fill in defaults."""
+    if not isinstance(raw, dict):
+        console.print(f"[red]Error:[/red] {_esc(source)} must contain a JSON object")
+        raise SystemExit(1)
+
+    name = raw.get("name")
+    if not isinstance(name, str) or not name.strip():
+        console.print(f"[red]Error:[/red] Missing or invalid 'name' in {_esc(source)}")
+        raise SystemExit(1)
+
+    version = raw.get("version")
+    if isinstance(version, bool) or not isinstance(version, (str, int, float)) or str(version).strip() == "":
+        console.print(
+            f"[red]Error:[/red] Missing or invalid 'version' in {_esc(source)} "
+            "(expected a non-empty string)"
+        )
+        raise SystemExit(1)
+
+    deps = raw.get("deps", [])
+    if not isinstance(deps, list) or not all(isinstance(d, str) and d.strip() for d in deps):
+        console.print(
+            f"[red]Error:[/red] 'deps' in {_esc(source)} must be a list of package names"
+        )
+        raise SystemExit(1)
+
+    desc = raw.get("desc", "")
+    if not isinstance(desc, str):
+        console.print(f"[red]Error:[/red] 'desc' in {_esc(source)} must be a string")
+        raise SystemExit(1)
+
+    config = dict(raw)
+    config.update(name=name.strip(), version=str(version).strip(), deps=list(deps), desc=desc)
+    return config
+
+
+def _read_project_config(directory: str) -> dict:
+    path = os.path.join(directory, "config.json")
+    if not os.path.isfile(path):
+        console.print("[red]Error:[/red] config.json not found")
+        raise SystemExit(1)
+    try:
+        with open(path, encoding="utf-8") as fp:
+            raw = json.load(fp)
+    except json.JSONDecodeError as exc:
+        console.print(f"[red]Error:[/red] Invalid JSON in config.json: {_esc(str(exc))}")
+        raise SystemExit(1)
+    except OSError as exc:
+        console.print(f"[red]Error:[/red] Could not read config.json: {_esc(str(exc))}")
+        raise SystemExit(1)
+    return _normalize_config(raw, "config.json")
+
+
+def _read_archive_config(wld_file: str) -> dict:
+    """Read and validate config.json from a .wld archive."""
+    try:
+        with zipfile.ZipFile(wld_file) as zf:
+            try:
+                raw_bytes = zf.read("config.json")
+            except KeyError:
+                console.print("[red]Error:[/red] config.json missing from archive")
+                raise SystemExit(1)
+    except zipfile.BadZipFile:
+        console.print(
+            f"[red]Error:[/red] '{_esc(os.path.basename(wld_file))}' is not a valid "
+            f"{WLD_EXT} archive"
+        )
+        raise SystemExit(1)
+    except OSError as exc:
+        console.print(f"[red]Error:[/red] Could not read archive: {_esc(str(exc))}")
+        raise SystemExit(1)
+
+    try:
+        raw = json.loads(raw_bytes)
+    except (json.JSONDecodeError, UnicodeDecodeError) as exc:
+        console.print(f"[red]Error:[/red] Invalid config.json in archive: {_esc(str(exc))}")
+        raise SystemExit(1)
+    return _normalize_config(raw, "archive config.json")
+
+
+def _create_wld_archive(directory: str, archive_path: str) -> None:
+    """Create *archive_path* from *directory*, skipping junk and cache files."""
+    parent = os.path.dirname(os.path.abspath(archive_path))
+    os.makedirs(parent, exist_ok=True)
+    fd, tmp_path = tempfile.mkstemp(prefix=".weld-build-", suffix=WLD_EXT, dir=parent)
+    os.close(fd)
+    try:
+        with zipfile.ZipFile(tmp_path, "w", zipfile.ZIP_DEFLATED) as zf:
+            for root, dirs, files in os.walk(directory):
+                dirs[:] = sorted(
+                    d for d in dirs
+                    if d not in _ARCHIVE_EXCLUDE_DIRS
+                    and not os.path.islink(os.path.join(root, d))
+                )
+                for filename in sorted(files):
+                    if filename.endswith(_ARCHIVE_EXCLUDE_SUFFIXES):
+                        continue
+                    full = os.path.join(root, filename)
+                    if os.path.islink(full) or not os.path.isfile(full):
+                        continue
+                    rel = os.path.relpath(full, directory).replace(os.sep, "/")
+                    zf.write(full, rel)
+        os.replace(tmp_path, archive_path)
+    except OSError as exc:
+        console.print(f"[red]Error:[/red] Could not create archive: {_esc(str(exc))}")
+        raise SystemExit(1)
+    finally:
+        if os.path.exists(tmp_path):
+            os.remove(tmp_path)
+
+
+def _extract_wld_archive(wld_file: str, dest: str) -> None:
+    """Safely extract a .wld archive into *dest*."""
+    dest_abs = os.path.abspath(dest)
+    os.makedirs(dest_abs, exist_ok=True)
+    try:
+        with zipfile.ZipFile(wld_file) as zf:
+            infos = zf.infolist()
+            if len(infos) > _MAX_ARCHIVE_ENTRIES:
+                console.print(
+                    f"[red]Error:[/red] Archive contains too many entries "
+                    f"({len(infos)} > {_MAX_ARCHIVE_ENTRIES})"
+                )
+                raise SystemExit(1)
+
+            total_size = 0
+            for info in infos:
+                raw_name = info.filename
+                name = raw_name.replace("\\", "/")
+                norm = os.path.normpath(name)
+                unsafe = (
+                    not name
+                    or name.startswith("/")
+                    or re.match(r"^[A-Za-z]:", name) is not None
+                    or norm == ".."
+                    or norm.startswith("../")
+                    or os.path.isabs(norm)
+                )
+                if unsafe:
+                    console.print(
+                        f"[red]Error:[/red] Unsafe path in archive: '{_esc(raw_name)}'"
+                    )
+                    raise SystemExit(1)
+
+                mode = info.external_attr >> 16
+                if stat.S_ISLNK(mode):
+                    console.print(
+                        f"[red]Error:[/red] Archive contains a symbolic link: "
+                        f"'{_esc(raw_name)}'"
+                    )
+                    raise SystemExit(1)
+
+                total_size += info.file_size
+                if total_size > _MAX_ARCHIVE_BYTES:
+                    console.print(
+                        "[red]Error:[/red] Archive expands to more than "
+                        f"{_MAX_ARCHIVE_BYTES // (1 << 20)} MiB; refusing to extract"
+                    )
+                    raise SystemExit(1)
+
+                target = os.path.join(dest_abs, norm)
+                if info.is_dir():
+                    os.makedirs(target, exist_ok=True)
+                    continue
+                os.makedirs(os.path.dirname(target), exist_ok=True)
+                with zf.open(info) as src, open(target, "wb") as out:
+                    shutil.copyfileobj(src, out)
+                if mode & 0o777:
+                    os.chmod(target, mode & 0o777)
+    except zipfile.BadZipFile:
+        console.print(f"[red]Error:[/red] '{_esc(os.path.basename(wld_file))}' is not a valid archive")
+        raise SystemExit(1)
+    except OSError as exc:
+        console.print(f"[red]Error:[/red] Failed to extract archive: {_esc(str(exc))}")
+        raise SystemExit(1)
+
+
+# ---------------------------------------------------------------------------
 # Spinner
 # ---------------------------------------------------------------------------
 
@@ -774,7 +1076,7 @@ def spinner(message: str):
     ok = True
     try:
         yield
-    except (Exception, KeyboardInterrupt):
+    except BaseException:
         ok = False
         raise
     finally:
@@ -792,13 +1094,22 @@ def spinner(message: str):
 # ---------------------------------------------------------------------------
 
 def _log(action: str, pkg_name: str, extra: str = "") -> None:
-    ts   = now_iso()
-    # Use a tab-separated format so pkg_name spaces don't break parsing
-    line = f"{ts}\t{action}\t{pkg_name}"
+    ts = now_iso()
+
+    # Tab-separated; strip separators so user-provided text cannot corrupt it.
+    def clean(value: str) -> str:
+        return str(value).replace("\t", " ").replace("\r", " ").replace("\n", " ")
+
+    line = f"{ts}\t{clean(action)}\t{clean(pkg_name)}"
     if extra:
-        line += f"\t{extra}"
-    with open(WELD_HISTORY, "a") as fp:
-        fp.write(line + "\n")
+        line += f"\t{clean(extra)}"
+    try:
+        os.makedirs(WELD_DIR, exist_ok=True)
+        with open(WELD_HISTORY, "a", encoding="utf-8") as fp:
+            fp.write(line + "\n")
+    except OSError:
+        # History is best-effort; never fail an operation because of it.
+        pass
 
 
 # ---------------------------------------------------------------------------
@@ -821,7 +1132,7 @@ def _load_plugin(pkg_dir: str) -> object | None:
     module = importlib.util.module_from_spec(spec)
     try:
         spec.loader.exec_module(module)
-    except Exception as exc:
+    except Exception as exc:  # noqa: BLE001 - user plugin code
         _print(f"{_YELLOW}Warning:{_RESET} Plugin failed to load: {exc}")
         return None
     return module
@@ -838,7 +1149,7 @@ def _call_hook(module: object | None, hook: str, *args) -> None:
     if callable(fn):
         try:
             fn(*args)
-        except Exception as exc:
+        except Exception as exc:  # noqa: BLE001 - user plugin code
             _print(f"{_YELLOW}Warning:{_RESET} Plugin hook '{hook}' raised: {exc}")
 
 
@@ -853,31 +1164,46 @@ def bootstrap() -> None:
 
     plugin_init = os.path.join(WELD_PLUGINS, "__init__.py")
     if not os.path.isfile(plugin_init):
-        with open(plugin_init, "w") as fp:
-            fp.write(TEMPLATES["plugin"]["code"])
+        _atomic_write(plugin_init, TEMPLATES["plugin"]["code"])
 
     for name, tpl in TEMPLATES.items():
         path = os.path.join(WELD_TEMPLATES, f"{name}.py")
         if not os.path.isfile(path):
-            with open(path, "w") as fp:
-                fp.write(tpl["code"])
+            _atomic_write(path, tpl["code"])
 
     if not os.path.isfile(WELD_PACKAGES):
-        with open(WELD_PACKAGES, "w") as fp:
-            json.dump({}, fp, indent=4)
+        _write_json(WELD_PACKAGES, {})
 
     if not os.path.isfile(WELD_CONFIG):
-        with open(WELD_CONFIG, "wb") as fp:
-            tomli_w.dump(DEFAULT_CONFIG, fp)
+        _atomic_write(WELD_CONFIG, tomli_w.dumps(DEFAULT_CONFIG))
 
 
 def load_config() -> dict:
-    with open(WELD_CONFIG, "rb") as fp:
-        return tomllib.load(fp)
+    if not os.path.isfile(WELD_CONFIG):
+        try:
+            _atomic_write(WELD_CONFIG, tomli_w.dumps(DEFAULT_CONFIG))
+        except OSError as exc:
+            console.print(f"[red]Error:[/red] Could not create {_esc(WELD_CONFIG)}: {_esc(str(exc))}")
+            raise SystemExit(1)
+    try:
+        with open(WELD_CONFIG, "rb") as fp:
+            config = tomllib.load(fp)
+    except (OSError, tomllib.TOMLDecodeError) as exc:
+        console.print(f"[red]Error:[/red] Invalid config file {_esc(WELD_CONFIG)}: {_esc(str(exc))}")
+        raise SystemExit(1)
+    if not isinstance(config, dict):
+        console.print(f"[red]Error:[/red] Invalid config file {_esc(WELD_CONFIG)}")
+        raise SystemExit(1)
+    return config
+
+
+def _weld_settings() -> dict:
+    settings = load_config().get("weld", {})
+    return settings if isinstance(settings, dict) else {}
 
 
 def get_compiler() -> str:
-    val = load_config().get("weld", {}).get("compiler", "nuitka").lower()
+    val = str(_weld_settings().get("compiler", "nuitka")).lower()
     if val not in ("nuitka", "pyinstaller"):
         _print(f"{_YELLOW}Warning:{_RESET} Unknown compiler '{val}', falling back to nuitka")
         return "nuitka"
@@ -885,11 +1211,15 @@ def get_compiler() -> str:
 
 
 def get_libs_compiler() -> str:
-    val = load_config().get("weld", {}).get("libs_compiler", "cython").lower()
+    val = str(_weld_settings().get("libs_compiler", "cython")).lower()
     if val != "cython":
         _print(f"{_YELLOW}Warning:{_RESET} Unknown libs_compiler '{val}', falling back to cython")
         return "cython"
     return val
+
+
+def get_auto_pip_install() -> bool:
+    return bool(_weld_settings().get("auto_pip_install", True))
 
 
 # ---------------------------------------------------------------------------
@@ -924,55 +1254,87 @@ def filter_dirs(directory: str, extension: str) -> list[str]:
 def _packages_lock():
     """Exclusive file lock around packages.json so concurrent runs are safe."""
     os.makedirs(WELD_DIR, exist_ok=True)
-    with open(WELD_LOCK, "w") as lf:
-        fcntl.flock(lf, fcntl.LOCK_EX)
+    with open(WELD_LOCK, "a+", encoding="utf-8") as lf:
+        if fcntl is not None:
+            fcntl.flock(lf, fcntl.LOCK_EX)
         try:
             yield
         finally:
-            fcntl.flock(lf, fcntl.LOCK_UN)
+            if fcntl is not None:
+                fcntl.flock(lf, fcntl.LOCK_UN)
 
 
 def load_packages() -> dict:
-    with open(WELD_PACKAGES) as fp:
-        return json.load(fp)
+    if not os.path.isfile(WELD_PACKAGES):
+        return {}
+    try:
+        with open(WELD_PACKAGES, encoding="utf-8") as fp:
+            data = json.load(fp)
+    except json.JSONDecodeError as exc:
+        console.print(
+            f"[red]Error:[/red] Corrupt package database {_esc(WELD_PACKAGES)}: {_esc(str(exc))}\n"
+            f"[dim]Fix the JSON or delete the file to start fresh.[/dim]"
+        )
+        raise SystemExit(1)
+    except OSError as exc:
+        console.print(f"[red]Error:[/red] Could not read {_esc(WELD_PACKAGES)}: {_esc(str(exc))}")
+        raise SystemExit(1)
+    if not isinstance(data, dict):
+        console.print(
+            f"[red]Error:[/red] Corrupt package database {_esc(WELD_PACKAGES)}: "
+            "expected a JSON object"
+        )
+        raise SystemExit(1)
+    return data
 
 
 def save_packages(data: dict) -> None:
-    with open(WELD_PACKAGES, "w") as fp:
-        json.dump(data, fp, indent=4)
+    try:
+        _write_json(WELD_PACKAGES, data)
+    except OSError as exc:
+        console.print(f"[red]Error:[/red] Could not write {_esc(WELD_PACKAGES)}: {_esc(str(exc))}")
+        raise SystemExit(1)
 
 
-def ruff_check(path: str) -> bool:
-    return subprocess.run(
-        ["ruff", "check", path], capture_output=True, text=True
-    ).returncode == 0
+def ruff_check(path: str, cwd: str | None = None) -> tuple[bool, str]:
+    """Run ruff on *path*; returns (ok, combined output)."""
+    result = subprocess.run(
+        ["ruff", "check", "--no-cache", "--output-format=concise", path],
+        cwd=cwd, capture_output=True, text=True, check=False,
+    )
+    output = (result.stdout or "") + (result.stderr or "")
+    return result.returncode == 0, output
+
+
+def _has_uv() -> bool:
+    return shutil.which("uv") is not None
 
 
 def pip_install(package: str) -> str:
     """Install *package* via pip; returns 'uv' or 'pip' to indicate which was used.
     Raises RuntimeError with tool output on failure."""
-    if subprocess.run(["uv", "--version"], capture_output=True).returncode == 0:
+    if _has_uv():
         result = subprocess.run(
             ["uv", "pip", "install", package],
-            capture_output=True, text=True,
+            capture_output=True, text=True, check=False,
         )
-        if result.returncode != 0:
-            raise RuntimeError(
-                f"uv pip install {package} failed:\n"
-                f"{result.stderr or result.stdout}"
-            )
-        return "uv"
+        if result.returncode == 0:
+            return "uv"
+        # uv can fail outside a virtualenv; let pip have a try before giving up.
+        uv_error = (result.stderr or result.stdout or "").strip()
     else:
-        result = subprocess.run(
-            [sys.executable, "-m", "pip", "install", package],
-            capture_output=True, text=True,
-        )
-        if result.returncode != 0:
-            raise RuntimeError(
-                f"pip install {package} failed:\n"
-                f"{result.stderr or result.stdout}"
-            )
-        return "pip"
+        uv_error = ""
+
+    result = subprocess.run(
+        [sys.executable, "-m", "pip", "install", package],
+        capture_output=True, text=True, check=False,
+    )
+    if result.returncode != 0:
+        details = (result.stderr or result.stdout or "").strip()
+        if uv_error:
+            details = f"uv:\n{uv_error}\n\npip:\n{details}"
+        raise RuntimeError(f"pip install {package} failed:\n{details}")
+    return "pip"
 
 
 def now_iso() -> str:
@@ -1013,22 +1375,27 @@ def read_readme(pkg_name: str) -> str | None:
     path = readme_path_for(pkg_name)
     if not os.path.isfile(path):
         return None
-    with open(path) as fp:
-        return fp.read().strip()
+    try:
+        with open(path, encoding="utf-8", errors="replace") as fp:
+            return fp.read().strip()
+    except OSError:
+        return None
 
 
-def remove_readme(pkg_name: str) -> None:
+def remove_readme(pkg_name: str, silent: bool = False) -> None:
     path = readme_path_for(pkg_name)
     if os.path.isfile(path):
         os.remove(path)
-        _print(f"{_YELLOW}Removed:{_RESET} {path}")
+        if not silent:
+            _print(f"{_YELLOW}Removed:{_RESET} {path}")
 
 
-def remove_changelog(pkg_name: str) -> None:
+def remove_changelog(pkg_name: str, silent: bool = False) -> None:
     path = changelog_path_for(pkg_name)
     if os.path.isfile(path):
         os.remove(path)
-        _print(f"{_YELLOW}Removed:{_RESET} {path}")
+        if not silent:
+            _print(f"{_YELLOW}Removed:{_RESET} {path}")
 
 
 # ---------------------------------------------------------------------------
@@ -1084,7 +1451,7 @@ def compile_py_pyinstaller(full_path: str, cwd: str) -> subprocess.CompletedProc
             "--specpath", cwd,
             full_path,
         ],
-        cwd=cwd, capture_output=True, text=True,
+        cwd=cwd, capture_output=True, text=True, check=False,
     )
 
     # Clean up PyInstaller leftovers
@@ -1114,27 +1481,34 @@ def _compile_nuitka_live(full_path: str, cwd: str, label: str) -> subprocess.Com
     idx = 0
     _write(_HIDE_CURSOR)
 
-    for line in proc.stderr:
-        stderr_chunks.append(line)
-        stripped = line.rstrip("\n\r")
-        if stripped:
-            last_output = stripped
+    try:
+        for line in proc.stderr:
+            stderr_chunks.append(line)
+            stripped = line.rstrip("\n\r")
+            if stripped:
+                last_output = stripped
 
-        frame = SPINNER_FRAMES[idx % len(SPINNER_FRAMES)]
-        prefix_vis = 2 + len(label)  # frame + space + label
-        avail = max_vis - prefix_vis - 1
-        if avail < 0:
-            avail = 0
-        truncated = last_output[:avail]
+            frame = SPINNER_FRAMES[idx % len(SPINNER_FRAMES)]
+            prefix_vis = 2 + len(label)  # frame + space + label
+            avail = max(max_vis - prefix_vis - 1, 0)
+            truncated = last_output[:avail]
 
-        out = f"\r{_CLEAR_LINE}{_CYAN}{frame}{_RESET} {label}"
-        if truncated:
-            out += f" {_DIM}{truncated}{_RESET}"
-        _write(out)
-        idx += 1
+            out = f"\r{_CLEAR_LINE}{_CYAN}{frame}{_RESET} {label}"
+            if truncated:
+                out += f" {_DIM}{truncated}{_RESET}"
+            _write(out)
+            idx += 1
 
-    proc.wait()
-    _write(_SHOW_CURSOR)
+        proc.wait()
+    except BaseException:
+        proc.kill()
+        try:
+            proc.wait(timeout=5)
+        except subprocess.TimeoutExpired:
+            pass
+        raise
+    finally:
+        _write(_SHOW_CURSOR)
 
     ok = proc.returncode == 0
     icon = f"{_GREEN}✔{_RESET}" if ok else f"{_RED}✘{_RESET}"
@@ -1159,13 +1533,18 @@ def compile_to_so(python_file: str, inplace: bool = True) -> str:
         "from setuptools import setup\n"
         "from Cython.Build import cythonize\n\n"
         "setup(\n"
-        f"    ext_modules=cythonize(\"{os.path.basename(python_file)}\",\n"
+        f"    ext_modules=cythonize({os.path.basename(python_file)!r},\n"
         "    compiler_directives={\"language_level\": 3})\n"
         ")\n"
     )
 
-    setup_path = os.path.join(script_dir, "_setup_compile_tmp.py")
-    with open(setup_path, "w") as fp:
+    # Unique file name so a user module called _setup_compile_tmp.py is
+    # never overwritten.
+    fd, setup_path = tempfile.mkstemp(
+        prefix="_weld_setup_", suffix=".py", dir=script_dir
+    )
+    os.close(fd)
+    with open(setup_path, "w", encoding="utf-8") as fp:
         fp.write(setup_content)
 
     try:
@@ -1174,12 +1553,15 @@ def compile_to_so(python_file: str, inplace: bool = True) -> str:
             cmd.append("--inplace")
 
         with spinner(f"Cython  {os.path.basename(python_file)}"):
-            result = subprocess.run(cmd, cwd=script_dir, capture_output=True, text=True)
+            result = subprocess.run(
+                cmd, cwd=script_dir, capture_output=True, text=True, check=False
+            )
 
         if result.returncode != 0:
             raise RuntimeError(f"Cython build failed:\n{result.stderr}")
 
-        so_files = glob.glob(os.path.join(script_dir, f"{base_name}.cpython-*.so"))
+        pattern = os.path.join(glob.escape(script_dir), glob.escape(base_name) + ".cpython-*.so")
+        so_files = sorted(glob.glob(pattern))
         if not so_files:
             raise RuntimeError("Cython .so was not generated")
 
@@ -1209,9 +1591,10 @@ def compile_to_so(python_file: str, inplace: bool = True) -> str:
 def _get_template(name: str) -> dict | None:
     if name in TEMPLATES:
         return TEMPLATES[name]
+    _validate_template_name(name)
     path = os.path.join(WELD_TEMPLATES, f"{name}.py")
     if os.path.isfile(path):
-        with open(path) as fp:
+        with open(path, encoding="utf-8") as fp:
             code = fp.read()
         return {"code": code, "deps": [], "desc": "User-defined template"}
     return None
@@ -1236,6 +1619,9 @@ def cmd_template(template_name: str) -> None:
         console.print("[red]Error:[/red] bin/ directory not found in project")
         raise SystemExit(1)
 
+    # Validate the project config *before* touching any files.
+    project_config = _read_project_config(".")
+
     tpl = _get_template(template_name)
     if tpl is None:
         available = sorted(
@@ -1251,28 +1637,24 @@ def cmd_template(template_name: str) -> None:
 
     main_py = os.path.join("bin", "main.py")
     if os.path.isfile(main_py):
-        # Use a timestamped backup so repeated calls don't overwrite each other
+        # Use a timestamped backup so repeated calls don't overwrite each other.
+        # Backups are excluded from .wld archives (*.bak suffix).
         ts_tag = datetime.now().strftime("%Y%m%d_%H%M%S")
         backup = f"{main_py}.{ts_tag}.bak"
         shutil.copy2(main_py, backup)
         _print(f"{_DIM}Backed up bin/main.py -> {backup}{_RESET}")
 
-    with open(main_py, "w") as fp:
-        fp.write(tpl["code"])
+    _atomic_write(main_py, tpl["code"])
 
     _print(f"{_GREEN}{_BOLD}✔ Template applied:{_RESET} '{template_name}' -> bin/main.py")
 
-    with open("config.json") as fp:
-        project_config = json.load(fp)
-
     existing_deps = project_config.get("deps", [])
-    template_deps = tpl.get("deps", [])
+    template_deps = [d for d in tpl.get("deps", []) if isinstance(d, str)]
     merged, added = _merge_deps(existing_deps, template_deps)
 
     if added:
         project_config["deps"] = merged
-        with open("config.json", "w") as fp:
-            json.dump(project_config, fp, indent=4)
+        _write_json("config.json", project_config)
         _print(f"{_GREEN}✔ config.json updated{_RESET}  deps added:")
         for dep in added:
             _print(f"  {_CYAN}+{_RESET} {dep}")
@@ -1293,15 +1675,15 @@ def cmd_template_list() -> None:
         title="📄 Available Templates",
         box=ROUNDED, header_style="bold cyan", padding=(0, 1),
     )
-    table.add_column("Template",    style="bold green", width=18)
-    table.add_column("Description", style="white",      width=38)
-    table.add_column("pip deps",    style="yellow",     width=30)
+    table.add_column("Template",    style="bold green", max_width=18)
+    table.add_column("Description", style="white",      max_width=38)
+    table.add_column("pip deps",    style="yellow",     max_width=30)
 
     for name in sorted(names):
         tpl  = _get_template(name)
         desc = tpl.get("desc", "-")            if tpl else "-"
         deps = ", ".join(tpl.get("deps", [])) if tpl else "-"
-        table.add_row(name, desc, deps or "[dim]-[/dim]")
+        table.add_row(_esc(name), _esc(desc), _esc(deps) or "[dim]-[/dim]")
 
     console.print(table)
     _print(f"\n{_DIM}Usage:    weld --template <name>   (run inside a weld project){_RESET}")
@@ -1312,30 +1694,11 @@ def cmd_build(directory: str) -> None:
     directory = os.path.abspath(directory)
 
     if not os.path.isdir(directory):
-        console.print(f"[red]Error:[/red] Directory '{directory}' not found")
+        console.print(f"[red]Error:[/red] Directory '{_esc(directory)}' not found")
         raise SystemExit(1)
 
-    config_path = os.path.join(directory, "config.json")
-    if not os.path.isfile(config_path):
-        console.print("[red]Error:[/red] config.json not found")
-        raise SystemExit(1)
-
-    try:
-        with open(config_path) as fp:
-            config = json.load(fp)
-        for field in ("name", "version", "deps", "desc"):
-            _ = config[field]
-    except json.JSONDecodeError:
-        console.print("[red]Error:[/red] Invalid JSON in config.json")
-        raise SystemExit(1)
-    except KeyError as exc:
-        console.print(f"[red]Error:[/red] Missing field in config.json: {exc}")
-        raise SystemExit(1)
-
-    local_plugin  = _load_plugin(directory)
-    global_plugin = _load_global_plugin()
-    _call_hook(local_plugin,  "before_build", config)
-    _call_hook(global_plugin, "before_build", config)
+    config = _read_project_config(directory)
+    _validate_pkg_name(config["name"])
 
     bin_dir  = os.path.join(directory, "bin")
     main_py  = os.path.join(bin_dir, "main.py")
@@ -1348,56 +1711,66 @@ def cmd_build(directory: str) -> None:
         console.print("[red]Error:[/red] main.py not found in bin/")
         raise SystemExit(1)
 
+    local_plugin  = _load_plugin(directory)
+    global_plugin = _load_global_plugin()
+    _call_hook(local_plugin,  "before_build", config)
+    _call_hook(global_plugin, "before_build", config)
+
     if not os.path.isfile(os.path.join(directory, "Readme")):
         _print(f"{_YELLOW}Warning:{_RESET} No Readme found (optional but recommended)")
     if not os.path.isfile(os.path.join(directory, "Changelog")):
         _print(f"{_DIM}No Changelog found (optional).{_RESET}")
 
+    _require_tool("ruff", "Install it with: pip install ruff")
+
     _print(f"\n{_BOLD}{_CYAN}Running validators...{_RESET}")
 
-    summary_rows: list[tuple] = []
     bin_files  = filter_files(bin_dir,  ".py")
     libs_files = filter_files(libs_dir, ".py")
-    total      = len(bin_files) + len(libs_files) * 2
-    done       = 0
+    targets = (
+        [(f, f, os.path.join(bin_dir, f)) for f in bin_files]
+        + [(f"libs/{f}", f"libs/{f}", os.path.join(libs_dir, f)) for f in libs_files]
+    )
+    total = len(targets)
 
-    for py_file in bin_files:
-        full  = os.path.join(bin_dir, py_file)
-        done += 1
-        _progress(done, total, f"ruff  {py_file}")
-        ruff_ok = ruff_check(full)
-        py_compile.compile(full, doraise=True)
-        summary_rows.append((py_file, "✔" if ruff_ok else "✘", "-"))
-        if not ruff_ok:
-            _progress_done()
-            console.print(f"[red]Error:[/red] Ruff check failed for {py_file}")
-            raise SystemExit(1)
+    summary_rows: list[tuple[str, str, str]] = []
+    try:
+        for idx, (display, label, full) in enumerate(targets, 1):
+            _progress(idx, total, f"validating  {label}")
+            ruff_ok, output = ruff_check(full, cwd=directory)
+            if not ruff_ok:
+                _progress_done()
+                console.print(f"[red]Error:[/red] Ruff check failed for {_esc(display)}")
+                if output.strip():
+                    _print(output.rstrip())
+                raise SystemExit(1)
 
-    for py_file in libs_files:
-        full  = os.path.join(libs_dir, py_file)
-        done += 1
-        _progress(done, total, f"ruff  libs/{py_file}")
-        ruff_ok = ruff_check(full)
-        if not ruff_ok:
-            _progress_done()
-            console.print(f"[red]Error:[/red] Ruff failed for libs/{py_file}")
-            raise SystemExit(1)
-        done += 1
-        py_compile.compile(full, doraise=True)
-        summary_rows.append((f"libs/{py_file}", "✔"))
+            try:
+                py_compile.compile(full, doraise=True)
+            except py_compile.PyCompileError as exc:
+                _progress_done()
+                console.print(f"[red]Error:[/red] Syntax error in {_esc(display)}")
+                _print(str(exc).replace(directory + os.sep, ""))
+                raise SystemExit(1)
+            except OSError as exc:
+                _progress_done()
+                console.print(f"[red]Error:[/red] Could not compile {_esc(display)}: {_esc(str(exc))}")
+                raise SystemExit(1)
 
-    _progress_done()
+            summary_rows.append((display, "✔", "✔"))
+    finally:
+        _progress_done()
+        for d in (bin_dir, libs_dir):
+            for cache in ("__pycache__", ".mypy_cache", ".ruff_cache"):
+                shutil.rmtree(os.path.join(d, cache), ignore_errors=True)
 
     table = Table(title="Validation Summary", box=ROUNDED, header_style="bold cyan", padding=(0, 1))
-    table.add_column("File", style="bold white", width=30)
-    table.add_column("Ruff", style="green",      width=6)
+    table.add_column("File",     style="bold white", max_width=30)
+    table.add_column("Ruff",     style="green",      max_width=6)
+    table.add_column("Bytecode", style="green",      max_width=10)
     for row in summary_rows:
-        table.add_row(*row)
+        table.add_row(*(_esc(value) for value in row))
     console.print(table)
-
-    for d in (bin_dir, libs_dir):
-        for cache in ("__pycache__", ".mypy_cache", ".ruff_cache"):
-            shutil.rmtree(os.path.join(d, cache), ignore_errors=True)
 
     parent       = os.path.dirname(directory)
     archive_name = os.path.basename(directory) + WLD_EXT
@@ -1408,14 +1781,7 @@ def cmd_build(directory: str) -> None:
         _print(f"{_YELLOW}Warning:{_RESET} Overwriting existing archive: {archive_name}")
 
     with spinner(f"Wlding  {os.path.basename(directory)} -> {archive_name}"):
-        result = subprocess.run(
-            ["zip", "-r", archive_path, "."],
-            cwd=directory, capture_output=True, text=True,
-        )
-
-    if result.returncode != 0:
-        console.print(f"[red]Error:[/red] wld failed:\n{result.stderr}")
-        raise SystemExit(1)
+        _create_wld_archive(directory, archive_path)
 
     _call_hook(local_plugin,  "after_build", config, archive_path)
     _call_hook(global_plugin, "after_build", config, archive_path)
@@ -1423,11 +1789,35 @@ def cmd_build(directory: str) -> None:
     console.print(f"[bold green]Wlded:[/bold green] {archive_path}")
 
 
-def cmd_install(wld_file: str) -> None:
+def _copy_tree_tracked(
+    src_dir: str, dst_dir: str, prefix: str, created_abs: list[str],
+) -> list[str]:
+    """Copy a directory tree, returning tracked relative paths and recording
+    the absolute paths of newly copied files in *created_abs*."""
+    tracked: list[str] = []
+    for root, dirs, files in os.walk(src_dir):
+        dirs[:] = sorted(d for d in dirs if not _is_junk_name(d))
+        rel_root = os.path.relpath(root, src_dir)
+        target_root = dst_dir if rel_root == "." else os.path.join(dst_dir, rel_root)
+        os.makedirs(target_root, exist_ok=True)
+        for filename in sorted(files):
+            if _is_junk_name(filename):
+                continue
+            target = os.path.join(target_root, filename)
+            existed = os.path.exists(target)
+            shutil.copy2(os.path.join(root, filename), target)
+            if not existed:
+                created_abs.append(target)
+            rel = filename if rel_root == "." else os.path.join(rel_root, filename)
+            tracked.append(os.path.join(prefix, rel) if prefix else rel)
+    return tracked
+
+
+def cmd_install(wld_file: str, log_action: bool = True) -> None:
     wld_file = os.path.abspath(wld_file)
 
     if not os.path.isfile(wld_file):
-        console.print(f"[red]Error:[/red] File '{wld_file}' not found")
+        console.print(f"[red]Error:[/red] File '{_esc(wld_file)}' not found")
         raise SystemExit(1)
 
     if not wld_file.endswith(WLD_EXT):
@@ -1437,231 +1827,323 @@ def cmd_install(wld_file: str) -> None:
         )
         raise SystemExit(1)
 
-    global_plugin = _load_global_plugin()
+    config = _read_archive_config(wld_file)
+    pkg_name = config["name"]
+    _validate_pkg_name(pkg_name)
 
-    with tempfile.TemporaryDirectory() as tmp:
-        with spinner("Extracting wld archive"):
-            result = subprocess.run(
-                ["unzip", "-o", wld_file, "-d", tmp],
-                capture_output=True, text=True,
+    version = config["version"]
+    deps    = config["deps"]
+    desc    = config["desc"]
+
+    global_plugin = _load_global_plugin()
+    os.makedirs(WELD_BIN, exist_ok=True)
+    os.makedirs(WELD_LIBS, exist_ok=True)
+
+    with _packages_lock():
+        datac = load_packages()
+        if pkg_name in datac and datac[pkg_name].get("pinned", False):
+            console.print(
+                f"[red]Error:[/red] '{_esc(pkg_name)}' is pinned. "
+                "Unpin with --unpin first."
+            )
+            raise SystemExit(1)
+        old_info = copy.deepcopy(datac.get(pkg_name))
+
+        # Files / libs owned by other packages must never be deleted or
+        # considered stale when this package is upgraded.
+        other_files: set[str] = set()
+        other_libs: set[str] = set()
+        for other_name, other_info in datac.items():
+            if other_name == pkg_name:
+                continue
+            other_files.update(str(f) for f in other_info.get("files", []))
+            other_libs.update(str(lib) for lib in other_info.get("libs", []))
+
+    _call_hook(global_plugin, "before_install", config)
+
+    if deps:
+        if get_auto_pip_install():
+            _print(f"\n{_BOLD}{_CYAN}Installing dependencies...{_RESET}")
+            for idx, dep in enumerate(deps, 1):
+                _progress(idx, len(deps), dep)
+                try:
+                    tool = "uv" if _has_uv() else "pip"
+                    with spinner(f"{tool} pip install {dep}"):
+                        pip_install(dep)
+                except RuntimeError as exc:
+                    _progress_done()
+                    console.print(f"[red]Error:[/red] {_esc(str(exc))}")
+                    raise SystemExit(1)
+            _progress_done()
+        else:
+            _print(
+                f"{_DIM}Skipping installation of {len(deps)} dependency(ies) "
+                f"(auto_pip_install = false){_RESET}"
             )
 
-        if result.returncode != 0:
-            console.print(f"[red]Error:[/red] Failed to extract:\n{result.stderr}")
-            raise SystemExit(1)
+    compiler      = get_compiler()
+    libs_compiler = get_libs_compiler()
 
-        config_path = os.path.join(tmp, "config.json")
-        if not os.path.isfile(config_path):
-            console.print("[red]Error:[/red] config.json missing from archive")
-            raise SystemExit(1)
-
-        with open(config_path) as fp:
-            config = json.load(fp)
-
-        pkg_name = config.get("name", "")
-
-        # Validate package name before touching the filesystem
-        _validate_pkg_name(pkg_name)
-
-        _call_hook(global_plugin, "before_install", config)
-
-        has_readme    = store_readme(pkg_name, tmp)
-        has_changelog = store_changelog(pkg_name, tmp)
-
-        if not has_readme:
-            _print(f"{_DIM}No Readme in archive for '{pkg_name}'{_RESET}")
+    with tempfile.TemporaryDirectory(prefix="weld-install-") as tmp:
+        with spinner("Extracting wld archive"):
+            _extract_wld_archive(wld_file, tmp)
 
         tmp_bin = os.path.join(tmp, "bin")
         if not os.path.isdir(tmp_bin):
             console.print("[red]Error:[/red] bin/ missing from archive")
             raise SystemExit(1)
+        tmp_libs = os.path.join(tmp_bin, "libs")
 
-        existing_bin = {
-            f for f in os.listdir(WELD_BIN)
-            if os.path.isfile(os.path.join(WELD_BIN, f))
-        } if os.path.isdir(WELD_BIN) else set()
-        existing_libs = {
-            f.removesuffix(".so")
-            for f in os.listdir(WELD_LIBS)
-            if f.endswith(".so")
-        } if os.path.isdir(WELD_LIBS) else set()
+        # Rename main.py -> <pkg>.py so compilers name the binary after the
+        # package. Everything is compiled inside the temporary directory so a
+        # failure can never leave half-installed files in ~/.weld.
+        main_src = os.path.join(tmp_bin, "main.py")
+        main_dst = os.path.join(tmp_bin, f"{pkg_name}.py")
+        if os.path.isfile(main_src) and os.path.abspath(main_src) != os.path.abspath(main_dst):
+            os.replace(main_src, main_dst)
 
-        for item in os.listdir(tmp_bin):
-            src = os.path.join(tmp_bin, item)
-            dst = os.path.join(WELD_BIN, item)
-            if os.path.isdir(src):
-                shutil.copytree(src, dst, dirs_exist_ok=True)
+        py_files   = filter_files(tmp_bin, ".py")
+        libs_files = filter_files(tmp_libs, ".py") if os.path.isdir(tmp_libs) else []
+
+        if py_files:
+            if compiler == "nuitka":
+                _require_tool("nuitka", "Install it with: pip install nuitka")
             else:
-                shutil.copy2(src, dst)
-
-    # ------------------------------------------------------------------ #
-    # FIX #2: rename main.py -> <pkg>.py BEFORE collecting py_files list  #
-    # ------------------------------------------------------------------ #
-    main_src = os.path.join(WELD_BIN, "main.py")
-    main_dst = os.path.join(WELD_BIN, f"{pkg_name}.py")
-    if os.path.isfile(main_src):
-        os.rename(main_src, main_dst)
-
-    deps = config.get("deps", [])
-    if deps:
-        _print(f"\n{_BOLD}{_CYAN}Installing dependencies...{_RESET}")
-        for idx, dep in enumerate(deps, 1):
-            _progress(idx, len(deps), dep)
+                _require_tool("pyinstaller", "Install it with: pip install pyinstaller")
+            _print(f"\n{_BOLD}{_CYAN}Compiling with {compiler}...{_RESET}")
             try:
-                tool = "uv" if subprocess.run(["uv", "--version"], capture_output=True).returncode == 0 else "pip"
-                with spinner(f"{tool} pip install {dep}"):
-                    pip_install(dep)
-            except RuntimeError as exc:
+                for idx, py_file in enumerate(py_files, 1):
+                    full = os.path.join(tmp_bin, py_file)
+                    _progress(idx, len(py_files), py_file)
+                    if compiler == "nuitka":
+                        result = _compile_nuitka_live(full, tmp_bin, py_file)
+                    else:
+                        with spinner(f"{compiler}  {py_file}"):
+                            result = compile_py_pyinstaller(full, tmp_bin)
+                    if result.returncode != 0:
+                        console.print(
+                            f"[red]Error:[/red] {_esc(compiler)} failed for {_esc(py_file)}"
+                        )
+                        stderr = (result.stderr or "").strip()
+                        if stderr:
+                            _print(stderr[-4000:])
+                        raise SystemExit(1)
+            finally:
                 _progress_done()
-                console.print(f"[red]Error:[/red] {exc}")
-                raise SystemExit(1)
-        _progress_done()
 
-    compiler = get_compiler()
-
-    # Collect AFTER rename so the list reflects the actual filenames on disk
-    py_files   = filter_files(WELD_BIN,  ".py")
-    libs_files = filter_files(WELD_LIBS, ".py")
-
-    _print(f"\n{_BOLD}{_CYAN}Compiling with {compiler}...{_RESET}")
-
-    for idx, py_file in enumerate(py_files, 1):
-        full = os.path.join(WELD_BIN, py_file)
-        _progress(idx, len(py_files), py_file)
-        if compiler == "nuitka":
-            result = _compile_nuitka_live(full, WELD_BIN, py_file)
-        else:
-            with spinner(f"{compiler}  {py_file}"):
-                result = compile_py_pyinstaller(full, WELD_BIN)
-        if result.returncode != 0:
-            console.print(
-                f"[red]Error:[/red] {compiler} failed for {py_file}:\n{result.stderr}"
+        # Normalise compiler output names and remove build leftovers.
+        for bin_file in filter_files(tmp_bin, ".bin"):
+            os.replace(
+                os.path.join(tmp_bin, bin_file),
+                os.path.join(tmp_bin, bin_file.removesuffix(".bin")),
             )
-            raise SystemExit(1)
-        os.remove(full)
+        for build_dir in filter_dirs(tmp_bin, ".build"):
+            shutil.rmtree(os.path.join(tmp_bin, build_dir), ignore_errors=True)
 
-    _progress_done()
+        binary_names = {os.path.splitext(py_file)[0] for py_file in py_files}
+        for py_file in py_files:
+            path = os.path.join(tmp_bin, py_file)
+            if os.path.exists(path):
+                os.remove(path)
+        for cache in ("__pycache__", ".mypy_cache", ".ruff_cache"):
+            shutil.rmtree(os.path.join(tmp_bin, cache), ignore_errors=True)
 
-    for bin_file in filter_files(WELD_BIN, ".bin"):
-        os.rename(
-            os.path.join(WELD_BIN, bin_file),
-            os.path.join(WELD_BIN, bin_file.removesuffix(".bin")),
-        )
-    for build_dir in filter_dirs(WELD_BIN, ".build"):
-        shutil.rmtree(os.path.join(WELD_BIN, build_dir))
+        compiled_libs: list[str] = []
+        if libs_files:
+            _print(f"\n{_BOLD}{_CYAN}Compiling libs with {libs_compiler}...{_RESET}")
+            if importlib.util.find_spec("Cython") is None:
+                console.print(
+                    "[red]Error:[/red] Cython is not installed. "
+                    "Install it with: pip install cython"
+                )
+                raise SystemExit(1)
+            if importlib.util.find_spec("setuptools") is None:
+                console.print(
+                    "[red]Error:[/red] setuptools is not installed. "
+                    "Install it with: pip install setuptools"
+                )
+                raise SystemExit(1)
+            try:
+                for idx, py_file in enumerate(libs_files, 1):
+                    full = os.path.join(tmp_libs, py_file)
+                    _progress(idx, len(libs_files), py_file)
+                    try:
+                        so_path = compile_to_so(full)
+                    except (RuntimeError, OSError, ValueError) as exc:
+                        console.print(
+                            f"[red]Error:[/red] Cython failed for libs/{_esc(py_file)}"
+                        )
+                        _print(str(exc))
+                        raise SystemExit(1)
+                    compiled_libs.append(os.path.basename(so_path).removesuffix(".so"))
+                    if os.path.exists(full):
+                        os.remove(full)
+            finally:
+                _progress_done()
+            for cache in ("__pycache__", "build", ".mypy_cache", ".ruff_cache"):
+                shutil.rmtree(os.path.join(tmp_libs, cache), ignore_errors=True)
 
-    if libs_files:
-        _print(f"\n{_BOLD}{_CYAN}Compiling libs with {get_libs_compiler()}...{_RESET}")
-        for idx, py_file in enumerate(libs_files, 1):
-            full = os.path.join(WELD_LIBS, py_file)
-            _progress(idx, len(libs_files), py_file)
-            compile_to_so(full)
-            os.remove(full)
-        _progress_done()
+        # Everything left in bin/ (except libs/ and junk) is an installable
+        # artifact: either a compiled binary or a data file/directory.
+        artifacts: list[str] = []
+        for entry in sorted(os.listdir(tmp_bin)):
+            if entry == "libs" or _is_junk_name(entry):
+                continue
+            src = os.path.join(tmp_bin, entry)
+            if os.path.islink(src) or not (os.path.isfile(src) or os.path.isdir(src)):
+                continue
+            artifacts.append(entry)
 
-    for cache in (".mypy_cache", ".ruff_cache", "__pycache__", "build"):
-        shutil.rmtree(os.path.join(WELD_LIBS, cache), ignore_errors=True)
-        shutil.rmtree(os.path.join(WELD_BIN,  cache), ignore_errors=True)
+        created_files: list[str] = []
+        created_libs: list[str] = []
+        installed_files: list[str] = []
 
-    files = sorted(
-        f for f in os.listdir(WELD_BIN)
-        if os.path.isfile(os.path.join(WELD_BIN, f)) and f not in existing_bin
-    )
-    libs = sorted(
-        f.removesuffix(".so")
-        for f in os.listdir(WELD_LIBS)
-        if f.endswith(".so") and f.removesuffix(".so") not in existing_libs
-    ) if os.path.isdir(WELD_LIBS) else []
+        try:
+            for entry in artifacts:
+                src = os.path.join(tmp_bin, entry)
+                dst = os.path.join(WELD_BIN, entry)
+                if os.path.isdir(src):
+                    installed_files.extend(
+                        _copy_tree_tracked(src, dst, entry, created_files)
+                    )
+                else:
+                    existed = os.path.exists(dst)
+                    shutil.copy2(src, dst)
+                    if not existed:
+                        created_files.append(dst)
+                    installed_files.append(entry)
+                    if entry in binary_names:
+                        os.chmod(dst, 0o755)
 
-    # FIX #15: hold the lock for the entire read-modify-write cycle
-    with _packages_lock():
-        datac   = load_packages()
-        already = pkg_name in datac
-        datac[pkg_name] = {
-            "deps":          config["deps"],
-            "version":       config["version"],
-            "desc":          config["desc"],
-            "files":         files,
-            "libs":          libs,
-            "has_readme":    has_readme,
-            "has_changelog": has_changelog,
-            "pinned":        datac[pkg_name].get("pinned", False) if already else False,
-            "note":          datac[pkg_name].get("note",   "")    if already else "",
-            "installed_at":  datac[pkg_name].get("installed_at", now_iso()) if already else now_iso(),
-            "updated_at":    now_iso(),
-        }
-        save_packages(datac)
+            for lib in compiled_libs:
+                src = os.path.join(tmp_libs, f"{lib}.so")
+                dst = os.path.join(WELD_LIBS, f"{lib}.so")
+                existed = os.path.exists(dst)
+                shutil.copy2(src, dst)
+                if not existed:
+                    created_libs.append(dst)
+
+            has_readme    = store_readme(pkg_name, tmp)
+            has_changelog = store_changelog(pkg_name, tmp)
+            if not has_readme:
+                remove_readme(pkg_name, silent=True)
+                _print(f"{_DIM}No Readme in archive for '{pkg_name}'{_RESET}")
+            if not has_changelog:
+                remove_changelog(pkg_name, silent=True)
+
+            with _packages_lock():
+                datac   = load_packages()
+                already = pkg_name in datac
+                datac[pkg_name] = {
+                    "deps":          deps,
+                    "version":       version,
+                    "desc":          desc,
+                    "files":         sorted(installed_files),
+                    "libs":          sorted(compiled_libs),
+                    "has_readme":    has_readme,
+                    "has_changelog": has_changelog,
+                    "pinned":        datac[pkg_name].get("pinned", False) if already else False,
+                    "note":          datac[pkg_name].get("note", "")    if already else "",
+                    "installed_at":  datac[pkg_name].get("installed_at", now_iso()) if already else now_iso(),
+                    "updated_at":    now_iso(),
+                }
+                save_packages(datac)
+        except BaseException:
+            # Roll back files that did not exist before this install. Files
+            # belonging to a previously installed version are left in place.
+            old_files = set(old_info.get("files", [])) if old_info else set()
+            old_libs  = set(old_info.get("libs",  [])) if old_info else set()
+            for path in created_files:
+                rel = os.path.relpath(path, WELD_BIN)
+                if rel in old_files:
+                    continue
+                try:
+                    if os.path.isfile(path):
+                        os.remove(path)
+                        _prune_empty_dirs(WELD_BIN, rel)
+                except OSError:
+                    pass
+            for path in created_libs:
+                lib = os.path.basename(path).removesuffix(".so")
+                if lib in old_libs:
+                    continue
+                try:
+                    if os.path.isfile(path):
+                        os.remove(path)
+                except OSError:
+                    pass
+            raise
+
+        # Remove artifacts that belonged to the previous version and are not
+        # part of this one (unless another installed package also needs them).
+        if old_info:
+            for rel in old_info.get("files", []):
+                if rel in other_files or rel in installed_files:
+                    continue
+                target = _safe_join(WELD_BIN, str(rel))
+                if target and os.path.isfile(target):
+                    try:
+                        os.remove(target)
+                        _prune_empty_dirs(WELD_BIN, str(rel))
+                    except OSError:
+                        pass
+            for lib in old_info.get("libs", []):
+                if lib in other_libs or lib in compiled_libs:
+                    continue
+                target = _safe_join(WELD_LIBS, f"{lib}.so")
+                if target and os.path.isfile(target):
+                    try:
+                        os.remove(target)
+                    except OSError:
+                        pass
 
     _call_hook(global_plugin, "after_install", config)
-    _log("INSTALL", pkg_name, config["version"])
-    _print(f"\n{_GREEN}{_BOLD}✔ Installed:{_RESET} {pkg_name} {config['version']}")
+    if log_action:
+        _log("INSTALL", pkg_name, version)
+    _print(f"\n{_GREEN}{_BOLD}✔ Installed:{_RESET} {pkg_name} {version}")
 
 
 def cmd_update(wld_file: str) -> None:
     wld_file = os.path.abspath(wld_file)
     if not os.path.isfile(wld_file):
-        console.print(f"[red]Error:[/red] File '{wld_file}' not found")
+        console.print(f"[red]Error:[/red] File '{_esc(wld_file)}' not found")
         raise SystemExit(1)
 
-    result = subprocess.run(
-        ["unzip", "-p", wld_file, "config.json"],
-        capture_output=True, text=True,
-    )
-    if result.returncode != 0:
-        console.print("[red]Error:[/red] Could not read config.json from archive")
-        raise SystemExit(1)
-
-    try:
-        config   = json.loads(result.stdout)
-        pkg_name = config["name"]
-    except (json.JSONDecodeError, KeyError):
-        console.print("[red]Error:[/red] Invalid config.json in archive")
-        raise SystemExit(1)
-
+    config   = _read_archive_config(wld_file)
+    pkg_name = config["name"]
     _validate_pkg_name(pkg_name)
 
     with _packages_lock():
         datac = load_packages()
-        if pkg_name in datac and datac[pkg_name].get("pinned", False):
-            _print(f"{_YELLOW}Skipped:{_RESET} '{pkg_name}' is pinned. Unpin with --unpin first.")
+        old_info = copy.deepcopy(datac.get(pkg_name))
+        if old_info is not None and old_info.get("pinned", False):
+            _print(
+                f"{_YELLOW}Skipped:{_RESET} '{pkg_name}' is pinned. "
+                "Unpin with --unpin first."
+            )
             return
 
     global_plugin = _load_global_plugin()
     _call_hook(global_plugin, "before_update", config)
 
-    with _packages_lock():
-        datac = load_packages()
-        if pkg_name not in datac:
-            _print(f"{_YELLOW}Warning:{_RESET} '{pkg_name}' not installed, running fresh install")
-            old_info = None
-        else:
-            _print(
-                f"{_CYAN}Updating:{_RESET} {pkg_name}  "
-                f"{datac[pkg_name].get('version', '?')} -> {config['version']}"
-            )
-            old_info = copy.deepcopy(datac[pkg_name])
+    if old_info is None:
+        _print(
+            f"{_YELLOW}Warning:{_RESET} '{pkg_name}' not installed, "
+            "running a fresh install"
+        )
+    else:
+        _print(
+            f"{_CYAN}Updating:{_RESET} {pkg_name}  "
+            f"{old_info.get('version', '?')} -> {config['version']}"
+        )
 
-    # FIX #10: snapshot old state; restore it if the install step fails
-    if old_info is not None:
-        cmd_remove(pkg_name, silent=True)
-
-    try:
-        cmd_install(wld_file)
-    except SystemExit:
-        # Install failed — restore old package record so the user isn't left
-        # with a broken / missing entry in packages.json.
-        if old_info is not None:
-            with _packages_lock():
-                datac = load_packages()
-                datac[pkg_name] = old_info
-                save_packages(datac)
-            _print(
-                f"{_RED}Update failed — previous package record restored.{_RESET}"
-            )
-        raise
+    # cmd_install() compiles everything in a temporary directory and only
+    # touches the installed files once compilation succeeded, so a failed
+    # update leaves the previous version intact and installed.
+    cmd_install(wld_file, log_action=False)
 
     _call_hook(global_plugin, "after_update", config)
-    _log("UPDATE", pkg_name, config["version"])
+    _log("UPDATE" if old_info is not None else "INSTALL", pkg_name, config["version"])
 
 
 def cmd_new(folder_name: str) -> None:
@@ -1670,37 +2152,42 @@ def cmd_new(folder_name: str) -> None:
         console.print("[red]Error:[/red] Folder already exists")
         raise SystemExit(1)
 
-    default_version = load_config().get("weld", {}).get("default_version", "1.0.0")
+    # Use only the final path component as the package name; an absolute path
+    # such as /tmp/myapp must not end up in config.json.
+    pkg_name = os.path.basename(os.path.normpath(target))
+    _validate_pkg_name(pkg_name)
+
+    default_version = str(_weld_settings().get("default_version", "1.0.0"))
 
     try:
         os.makedirs(os.path.join(target, "bin", "libs"))
         os.makedirs(os.path.join(target, "plugins"))
 
-        with open(os.path.join(target, "config.json"), "w") as fp:
-            json.dump(
-                {"name": folder_name, "deps": [], "version": default_version, "desc": ""},
-                fp, indent=4,
-            )
+        _write_json(
+            os.path.join(target, "config.json"),
+            {"name": pkg_name, "deps": [], "version": default_version, "desc": ""},
+        )
 
-        with open(os.path.join(target, "bin", "main.py"), "w") as fp:
-            fp.write(TEMPLATES["hello"]["code"])
+        _atomic_write(os.path.join(target, "bin", "main.py"), TEMPLATES["hello"]["code"])
 
-        with open(os.path.join(target, "Readme"), "w") as fp:
-            fp.write(
-                f"# {folder_name}\n\n"
-                "## Description\n\nDescribe your package here.\n\n"
-                f"## Usage\n\n```\nweld --run {folder_name}\n```\n"
-            )
+        _atomic_write(
+            os.path.join(target, "Readme"),
+            f"# {pkg_name}\n\n"
+            "## Description\n\nDescribe your package here.\n\n"
+            f"## Usage\n\n```\nweld --run {pkg_name}\n```\n",
+        )
 
-        with open(os.path.join(target, "Changelog"), "w") as fp:
-            fp.write(
-                f"# {folder_name} Changelog\n\n"
-                f"## {default_version}  {datetime.now().strftime('%Y-%m-%d')}\n\n"
-                "- Initial release\n"
-            )
+        _atomic_write(
+            os.path.join(target, "Changelog"),
+            f"# {pkg_name} Changelog\n\n"
+            f"## {default_version}  {datetime.now().strftime('%Y-%m-%d')}\n\n"
+            "- Initial release\n",
+        )
 
-        with open(os.path.join(target, "plugins", "__init__.py"), "w") as fp:
-            fp.write(TEMPLATES["plugin"]["code"])
+        _atomic_write(
+            os.path.join(target, "plugins", "__init__.py"),
+            TEMPLATES["plugin"]["code"],
+        )
 
         _print(f"{_GREEN}{_BOLD}Created:{_RESET} {folder_name}/")
         _print(f"  {_DIM}{folder_name}/config.json{_RESET}")
@@ -1712,14 +2199,15 @@ def cmd_new(folder_name: str) -> None:
         _print(f"\n{_DIM}Tip: weld --template <name>  to apply a different template{_RESET}")
 
     except OSError as exc:
-        console.print(f"[red]Error:[/red] {exc}")
+        shutil.rmtree(target, ignore_errors=True)
+        console.print(f"[red]Error:[/red] {_esc(str(exc))}")
         raise SystemExit(1)
 
 
 def cmd_info(pkg_name: str) -> None:
     datac = load_packages()
     if pkg_name not in datac:
-        console.print(f"[red]Error:[/red] Package '{pkg_name}' not found")
+        console.print(f"[red]Error:[/red] Package '{_esc(pkg_name)}' not found")
         raise SystemExit(1)
 
     info  = datac[pkg_name]
@@ -1762,30 +2250,59 @@ def cmd_run(pkg_name: str, extra_args: list[str]) -> None:
     after the package name are forwarded verbatim to the binary.
     Example:  weld --run mypkg --verbose input.txt
     """
-    binary = os.path.join(WELD_BIN, pkg_name)
-    if not os.path.isfile(binary):
-        console.print(f"[red]Error:[/red] Binary '{pkg_name}' not found in {WELD_BIN}")
+    _validate_pkg_name(pkg_name)
+    binary = _safe_join(WELD_BIN, pkg_name)
+    if binary is None or not os.path.isfile(binary):
+        console.print(f"[red]Error:[/red] Binary '{_esc(pkg_name)}' not found in {_esc(WELD_BIN)}")
         raise SystemExit(1)
     if not os.access(binary, os.X_OK):
         console.print(
-            f"[red]Error:[/red] '{binary}' is not executable.\n"
-            f"[dim]Hint: chmod +x {binary}[/dim]"
+            f"[red]Error:[/red] '{_esc(binary)}' is not executable.\n"
+            f"[dim]Hint: chmod +x {_esc(binary)}[/dim]"
         )
         raise SystemExit(1)
     os.execv(binary, [binary] + extra_args)
+
+
+def _field_as_text(name: str, info: dict, key: str) -> str:
+    if key == "name":
+        return name
+    value = info.get(key, "")
+    if isinstance(value, list):
+        return ", ".join(str(v) for v in value)
+    if isinstance(value, bool):
+        return "yes" if value else "no"
+    return "" if value is None else str(value)
+
+
+_LIST_FIELDS = (
+    "name", "version", "desc", "note", "deps", "files", "libs",
+    "pinned", "installed_at", "updated_at",
+)
 
 
 def cmd_list(sort_by: str = "name", filter_pat: str = "") -> None:
     packages = load_packages()
 
     if filter_pat:
-        key, _, pattern = filter_pat.partition("=")
-        packages = {
-            n: i for n, i in packages.items()
-            if fnmatch.fnmatch(
-                str(i.get(key.strip(), n) if key.strip() != "name" else n),
-                pattern.strip(),
+        key, sep, pattern = filter_pat.partition("=")
+        key     = key.strip()
+        pattern = pattern.strip()
+        if not sep or not key or not pattern:
+            console.print(
+                "[red]Error:[/red] --list-filter expects <field>=<glob>, "
+                "e.g. --list-filter version=1.*"
             )
+            raise SystemExit(1)
+        if key not in _LIST_FIELDS:
+            console.print(
+                f"[red]Error:[/red] Unknown filter field '{_esc(key)}'. "
+                f"Choose from: {', '.join(_LIST_FIELDS)}"
+            )
+            raise SystemExit(1)
+        packages = {
+            name: info for name, info in packages.items()
+            if fnmatch.fnmatch(_field_as_text(name, info, key), pattern)
         }
 
     valid_sorts = ("name", "version", "installed_at", "updated_at")
@@ -1795,7 +2312,8 @@ def cmd_list(sort_by: str = "name", filter_pat: str = "") -> None:
 
     packages = dict(sorted(
         packages.items(),
-        key=lambda item: item[0] if sort_by == "name" else item[1].get(sort_by, ""),
+        key=lambda item: item[0] if sort_by == "name"
+        else _field_as_text(item[0], item[1], sort_by),
     ))
 
     table = Table(
@@ -1803,31 +2321,31 @@ def cmd_list(sort_by: str = "name", filter_pat: str = "") -> None:
         header_style="bold cyan", box=ROUNDED,
         padding=(0, 1), row_styles=["", "dim"],
     )
-    table.add_column("#",            justify="right", width=4,  style="bold")
-    table.add_column("Package",      style="bold green",        width=18)
-    table.add_column("Version",      style="yellow",            width=10)
-    table.add_column("Description",  style="white",             width=22)
-    table.add_column("Dependencies", style="blue",              width=16)
-    table.add_column("Files",        style="magenta",           width=12)
-    table.add_column("Libs",         style="cyan",              width=12)
-    table.add_column("Readme",       style="dim",               width=7)
-    table.add_column("Pinned",       style="yellow",            width=7)
-    table.add_column("Installed",    style="dim",               width=20)
+    table.add_column("#",            justify="right", max_width=4,  style="bold")
+    table.add_column("Package",      style="bold green",        max_width=18)
+    table.add_column("Version",      style="yellow",            max_width=10)
+    table.add_column("Description",  style="white",             max_width=22)
+    table.add_column("Dependencies", style="blue",              max_width=16)
+    table.add_column("Files",        style="magenta",           max_width=12)
+    table.add_column("Libs",         style="cyan",              max_width=12)
+    table.add_column("Readme",       style="dim",               max_width=7)
+    table.add_column("Pinned",       style="yellow",            max_width=7)
+    table.add_column("Installed",    style="dim",               max_width=20)
 
     for idx, (name, info) in enumerate(packages.items(), 1):
         deps  = info.get("deps",  [])
         files = info.get("files", [])
         libs  = info.get("libs",  [])
         table.add_row(
-            str(idx), name,
-            info.get("version", "N/A"),
-            info.get("desc", "-"),
-            ", ".join(deps)  if deps  else "[italic]-[/italic]",
-            ", ".join(files) if files else "[italic]-[/italic]",
-            ", ".join(libs)  if libs  else "[italic]-[/italic]",
+            str(idx), _esc(name),
+            _esc(str(info.get("version", "N/A"))),
+            _esc(str(info.get("desc", "-"))),
+            _esc(", ".join(deps))  if deps  else "[italic]-[/italic]",
+            _esc(", ".join(files)) if files else "[italic]-[/italic]",
+            _esc(", ".join(libs))  if libs  else "[italic]-[/italic]",
             "✔" if os.path.isfile(readme_path_for(name)) else "-",
             "🔒" if info.get("pinned") else "-",
-            info.get("installed_at", "-"),
+            _esc(str(info.get("installed_at", "-"))),
         )
 
     console.print(table)
@@ -1847,31 +2365,58 @@ def cmd_remove(pkg_name: str, silent: bool = False) -> None:
     with _packages_lock():
         datac = load_packages()
         if pkg_name not in datac:
-            console.print(f"[red]Error:[/red] Package '{pkg_name}' not found")
+            console.print(f"[red]Error:[/red] Package '{_esc(pkg_name)}' not found")
             raise SystemExit(1)
         if datac[pkg_name].get("pinned", False):
-            console.print(f"[red]Error:[/red] '{pkg_name}' is pinned. Unpin with --unpin first.")
+            console.print(
+                f"[red]Error:[/red] '{_esc(pkg_name)}' is pinned. "
+                "Unpin with --unpin first."
+            )
             raise SystemExit(1)
 
         global_plugin = _load_global_plugin()
         _call_hook(global_plugin, "before_remove", pkg_name)
 
-        for f in datac[pkg_name].get("files", []):
-            path = os.path.join(WELD_BIN, f)
-            if os.path.exists(path):
+        # Never delete files or libs that another package still references
+        # (duplicated packages share binaries/data/libs).
+        other_files: set[str] = set()
+        other_libs: set[str] = set()
+        for other_name, other_info in datac.items():
+            if other_name == pkg_name:
+                continue
+            other_files.update(str(f) for f in other_info.get("files", []))
+            other_libs.update(str(lib) for lib in other_info.get("libs", []))
+
+        for rel in datac[pkg_name].get("files", []):
+            rel = str(rel)
+            if rel in other_files:
+                continue
+            path = _safe_join(WELD_BIN, rel)
+            if path is None:
+                _print(f"{_YELLOW}Warning:{_RESET} Skipping unsafe path '{rel}'")
+                continue
+            if os.path.isfile(path) or os.path.islink(path):
                 os.remove(path)
+                _prune_empty_dirs(WELD_BIN, rel)
                 if not silent:
                     _print(f"{_YELLOW}Removed:{_RESET} {path}")
 
         for lib in datac[pkg_name].get("libs", []):
-            path = os.path.join(WELD_LIBS, f"{lib}.so")
-            if os.path.exists(path):
+            lib = str(lib)
+            if lib in other_libs:
+                continue
+            path = _safe_join(WELD_LIBS, f"{lib}.so")
+            if path is None:
+                _print(f"{_YELLOW}Warning:{_RESET} Skipping unsafe lib path '{lib}'")
+                continue
+            if os.path.isfile(path) or os.path.islink(path):
                 os.remove(path)
+                _prune_empty_dirs(WELD_BIN, rel)
                 if not silent:
                     _print(f"{_YELLOW}Removed:{_RESET} {path}")
 
-        remove_readme(pkg_name)
-        remove_changelog(pkg_name)
+        remove_readme(pkg_name, silent=silent)
+        remove_changelog(pkg_name, silent=silent)
         del datac[pkg_name]
         save_packages(datac)
 
@@ -1885,7 +2430,7 @@ def cmd_pin(pkg_name: str) -> None:
     with _packages_lock():
         datac = load_packages()
         if pkg_name not in datac:
-            console.print(f"[red]Error:[/red] Package '{pkg_name}' not found")
+            console.print(f"[red]Error:[/red] Package '{_esc(pkg_name)}' not found")
             raise SystemExit(1)
         datac[pkg_name]["pinned"] = True
         save_packages(datac)
@@ -1897,7 +2442,7 @@ def cmd_unpin(pkg_name: str) -> None:
     with _packages_lock():
         datac = load_packages()
         if pkg_name not in datac:
-            console.print(f"[red]Error:[/red] Package '{pkg_name}' not found")
+            console.print(f"[red]Error:[/red] Package '{_esc(pkg_name)}' not found")
             raise SystemExit(1)
         datac[pkg_name]["pinned"] = False
         save_packages(datac)
@@ -1909,10 +2454,11 @@ def cmd_note(pkg_name: str, note: str) -> None:
     with _packages_lock():
         datac = load_packages()
         if pkg_name not in datac:
-            console.print(f"[red]Error:[/red] Package '{pkg_name}' not found")
+            console.print(f"[red]Error:[/red] Package '{_esc(pkg_name)}' not found")
             raise SystemExit(1)
         datac[pkg_name]["note"] = note
         save_packages(datac)
+    _log("NOTE", pkg_name, note)
     _print(f"{_GREEN}Note set:{_RESET} {pkg_name}  ->  {note}")
 
 
@@ -1921,30 +2467,43 @@ def cmd_rename(old_name: str, new_name: str) -> None:
     with _packages_lock():
         datac = load_packages()
         if old_name not in datac:
-            console.print(f"[red]Error:[/red] Package '{old_name}' not found")
+            console.print(f"[red]Error:[/red] Package '{_esc(old_name)}' not found")
             raise SystemExit(1)
         if new_name in datac:
-            console.print(f"[red]Error:[/red] Package '{new_name}' already exists")
+            console.print(f"[red]Error:[/red] Package '{_esc(new_name)}' already exists")
             raise SystemExit(1)
         if datac[old_name].get("pinned", False):
-            console.print(f"[red]Error:[/red] '{old_name}' is pinned, unpin before renaming.")
+            console.print(f"[red]Error:[/red] '{_esc(old_name)}' is pinned, unpin before renaming.")
             raise SystemExit(1)
 
         pkg_info = datac[old_name]
 
         old_bin = os.path.join(WELD_BIN, old_name)
+        new_bin = os.path.join(WELD_BIN, new_name)
+        if os.path.exists(new_bin):
+            console.print(
+                f"[red]Error:[/red] '{_esc(new_bin)}' already exists on disk; "
+                "remove it or choose another name."
+            )
+            raise SystemExit(1)
+
         if os.path.isfile(old_bin):
-            os.rename(old_bin, os.path.join(WELD_BIN, new_name))
+            os.rename(old_bin, new_bin)
             pkg_info["files"] = [
                 new_name if f == old_name else f
                 for f in pkg_info.get("files", [])
             ]
+        else:
+            _print(
+                f"{_YELLOW}Warning:{_RESET} Binary for '{old_name}' is missing; "
+                "the package record was renamed only."
+            )
 
         if os.path.isfile(readme_path_for(old_name)):
-            os.rename(readme_path_for(old_name), readme_path_for(new_name))
+            os.replace(readme_path_for(old_name), readme_path_for(new_name))
 
         if os.path.isfile(changelog_path_for(old_name)):
-            os.rename(changelog_path_for(old_name), changelog_path_for(new_name))
+            os.replace(changelog_path_for(old_name), changelog_path_for(new_name))
 
         datac[new_name] = pkg_info
         del datac[old_name]
@@ -1954,34 +2513,59 @@ def cmd_rename(old_name: str, new_name: str) -> None:
     _print(f"{_GREEN}{_BOLD}Renamed:{_RESET} '{old_name}' -> '{new_name}'")
 
 
+def _editor_command() -> list[str]:
+    editor = os.environ.get("EDITOR") or os.environ.get("VISUAL") or "nano"
+    try:
+        parts = shlex.split(editor)
+    except ValueError as exc:
+        console.print(f"[red]Error:[/red] Could not parse EDITOR '{_esc(editor)}': {_esc(str(exc))}")
+        raise SystemExit(1)
+    if not parts:
+        console.print("[red]Error:[/red] EDITOR is empty")
+        raise SystemExit(1)
+    return parts
+
+
 def cmd_edit(pkg_name: str) -> None:
     datac = load_packages()
     if pkg_name not in datac:
-        console.print(f"[red]Error:[/red] Package '{pkg_name}' not found")
+        console.print(f"[red]Error:[/red] Package '{_esc(pkg_name)}' not found")
         raise SystemExit(1)
-    editor = os.environ.get("EDITOR", "nano")
-    readme = readme_path_for(pkg_name)
-    if os.path.isfile(readme):
-        _print(f"{_DIM}Opening Readme for '{pkg_name}' in {editor}...{_RESET}")
-        os.execvp(editor, [editor, readme])
-    else:
-        # FIX #7: register cleanup with atexit so the temp file is always removed
-        tmp = tempfile.NamedTemporaryFile(
-            mode="w", suffix=f"_{pkg_name}.txt", delete=False
-        )
-        tmp_path = tmp.name
-        atexit.register(lambda p=tmp_path: os.unlink(p) if os.path.exists(p) else None)
 
-        info = datac[pkg_name]
-        tmp.write(
-            f"Package: {pkg_name}\n"
-            f"Version: {info.get('version', 'N/A')}\n"
-            f"Desc:    {info.get('desc', '')}\n"
-            f"Note:    {info.get('note', '')}\n"
-        )
-        tmp.flush()
-        tmp.close()
-        os.execvp(editor, [editor, tmp_path])
+    editor = _editor_command()
+    readme = readme_path_for(pkg_name)
+    info   = datac[pkg_name]
+
+    if os.path.isfile(readme):
+        _print(f"{_DIM}Opening Readme for '{pkg_name}' in {' '.join(editor)}...{_RESET}")
+        try:
+            subprocess.call([*editor, readme])
+        except OSError as exc:
+            console.print(f"[red]Error:[/red] Could not launch editor: {_esc(str(exc))}")
+            raise SystemExit(1)
+        return
+
+    fd, tmp_path = tempfile.mkstemp(suffix=f"_{pkg_name}.txt", prefix="weld-edit-")
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8") as tmp:
+            tmp.write(
+                f"Package: {pkg_name}\n"
+                f"Version: {info.get('version', 'N/A')}\n"
+                f"Desc:    {info.get('desc', '')}\n"
+                f"Note:    {info.get('note', '')}\n"
+            )
+        _print(f"{_DIM}Opening details for '{pkg_name}' in {' '.join(editor)}...{_RESET}")
+        try:
+            subprocess.call([*editor, tmp_path])
+        except OSError as exc:
+            console.print(f"[red]Error:[/red] Could not launch editor: {_esc(str(exc))}")
+            raise SystemExit(1)
+    finally:
+        try:
+            if os.path.exists(tmp_path):
+                os.remove(tmp_path)
+        except OSError:
+            pass
 
 
 def cmd_duplicate(src_name: str, dst_name: str) -> None:
@@ -1989,21 +2573,34 @@ def cmd_duplicate(src_name: str, dst_name: str) -> None:
     with _packages_lock():
         datac = load_packages()
         if src_name not in datac:
-            console.print(f"[red]Error:[/red] Package '{src_name}' not found")
+            console.print(f"[red]Error:[/red] Package '{_esc(src_name)}' not found")
             raise SystemExit(1)
         if dst_name in datac:
-            console.print(f"[red]Error:[/red] Package '{dst_name}' already exists")
+            console.print(f"[red]Error:[/red] Package '{_esc(dst_name)}' already exists")
             raise SystemExit(1)
 
         pkg_info = copy.deepcopy(datac[src_name])
 
         src_bin = os.path.join(WELD_BIN, src_name)
-        if os.path.isfile(src_bin):
-            shutil.copy2(src_bin, os.path.join(WELD_BIN, dst_name))
-            pkg_info["files"] = [
-                dst_name if f == src_name else f
-                for f in pkg_info.get("files", [])
-            ]
+        dst_bin = os.path.join(WELD_BIN, dst_name)
+        if not os.path.isfile(src_bin):
+            console.print(
+                f"[red]Error:[/red] Cannot duplicate '{_esc(src_name)}': "
+                "its binary is missing. Reinstall it first."
+            )
+            raise SystemExit(1)
+        if os.path.exists(dst_bin):
+            console.print(
+                f"[red]Error:[/red] '{_esc(dst_bin)}' already exists on disk; "
+                "remove it or choose another name."
+            )
+            raise SystemExit(1)
+
+        shutil.copy2(src_bin, dst_bin)
+        pkg_info["files"] = [
+            dst_name if f == src_name else f
+            for f in pkg_info.get("files", [])
+        ]
 
         if os.path.isfile(readme_path_for(src_name)):
             shutil.copy2(readme_path_for(src_name), readme_path_for(dst_name))
@@ -2029,8 +2626,8 @@ def cmd_history(pkg_name: str | None = None) -> None:
         _print(f"{_DIM}No history yet.{_RESET}")
         return
 
-    with open(WELD_HISTORY) as fp:
-        lines = [l.rstrip() for l in fp if l.strip()]
+    with open(WELD_HISTORY, encoding="utf-8", errors="replace") as fp:
+        lines = [line.rstrip() for line in fp if line.strip()]
 
     if not lines:
         _print(f"{_DIM}No history yet.{_RESET}")
@@ -2054,6 +2651,7 @@ def cmd_history(pkg_name: str | None = None) -> None:
         "UPDATE":    _CYAN,   "BUILD":     _CYAN,
         "PIN":       _YELLOW, "UNPIN":     _YELLOW,
         "RENAME":    _YELLOW, "DUPLICATE": _CYAN,
+        "NOTE":      _YELLOW,
     }
 
     if pkg_name:
@@ -2063,11 +2661,11 @@ def cmd_history(pkg_name: str | None = None) -> None:
             return
         _print(f"\n{_BOLD}{_CYAN}History for {pkg_name}{_RESET}\n")
         table = Table(box=ROUNDED, header_style="bold cyan", padding=(0, 1))
-        table.add_column("Date",    style="dim",    width=22)
-        table.add_column("Action",  style="yellow", width=12)
-        table.add_column("Details", style="white",  width=30)
+        table.add_column("Date",    style="dim",    max_width=22)
+        table.add_column("Action",  style="yellow", max_width=12)
+        table.add_column("Details", style="white",  max_width=30)
         for r in records:
-            table.add_row(r["ts"], r["action"], r["extra"] or "-")
+            table.add_row(_esc(r["ts"]), _esc(r["action"]), _esc(r["extra"] or "-"))
         console.print(table)
     else:
         grouped: dict[str, list] = defaultdict(list)
@@ -2111,6 +2709,7 @@ def cmd_stats() -> None:
     table.add_row("Total files",         str(total_files))
     table.add_row("Total libs",          str(total_libs))
     table.add_row("Total pip deps",      str(total_deps))
+    table.add_row("With deps",           str(with_deps))
     table.add_row("With readme",         str(with_readme))
     table.add_row("With notes",          str(with_notes))
     table.add_row("Pinned",              str(pinned))
@@ -2130,44 +2729,64 @@ def cmd_stats() -> None:
 
 
 def cmd_doctor() -> None:
+    compiler      = get_compiler()
+    libs_compiler = get_libs_compiler()
+
+    # (tool, version command, required?)
     tools = [
-        ("python",      [sys.executable,  "--version"]),
-        ("nuitka",      ["nuitka",         "--version"]),
-        ("pyinstaller", ["pyinstaller",    "--version"]),
-        ("ruff",        ["ruff",           "--version"]),
-        ("mypy",        ["mypy",           "--version"]),
-        ("cython",      ["cython",         "--version"]),
-        ("zip",         ["zip",            "--version"]),
-        ("unzip",       ["unzip",          "--version"]),
+        ("python",      [sys.executable,  "--version"], True),
+        ("ruff",        ["ruff",          "--version"], True),
+        ("nuitka",      ["nuitka",        "--version"], compiler == "nuitka"),
+        ("pyinstaller", ["pyinstaller",   "--version"], compiler == "pyinstaller"),
+        ("cython",      ["cython",        "--version"], False),
+        ("setuptools",  [sys.executable,  "-c", "import setuptools"], False),
+        ("mypy",        ["mypy",          "--version"], False),
+        ("uv",          ["uv",            "--version"], False),
+        ("zip",         ["zip",           "--version"], False),
+        ("unzip",       ["unzip",         "--version"], False),
     ]
 
     _print(f"\n{_BOLD}{_CYAN}weld doctor{_RESET}\n")
-    all_ok = True
-    rows: list[tuple[str, str, str]] = []
+    missing_required: list[str] = []
+    rows: list[tuple[str, str, str, str]] = []
 
-    for name, cmd in tools:
+    for name, cmd, required in tools:
         try:
-            result  = subprocess.run(cmd, capture_output=True, text=True, timeout=5)
-            first   = (result.stdout or result.stderr or "").splitlines()
-            version = first[0].strip() if first else "?"
-            rows.append((name, "✔", version))
+            result = subprocess.run(
+                cmd, capture_output=True, text=True, timeout=5, check=False
+            )
+            if result.returncode == 0:
+                first   = (result.stdout or result.stderr or "").splitlines()
+                version = first[0].strip() if first else "installed"
+                rows.append((name, "✔", version, "yes" if required else "no"))
+            elif required:
+                rows.append((name, "✘", "NOT WORKING", "yes"))
+                missing_required.append(name)
+            else:
+                rows.append((name, "-", "not available (optional)", "no"))
         except FileNotFoundError:
-            rows.append((name, "✘", "NOT FOUND"))
-            if name not in ("pyinstaller",):
-                all_ok = False
-        except Exception as exc:
-            rows.append((name, "✘", str(exc)))
-            all_ok = False
+            if required:
+                rows.append((name, "✘", "NOT FOUND", "yes"))
+                missing_required.append(name)
+            else:
+                rows.append((name, "-", "not found (optional)", "no"))
+        except Exception as exc:  # noqa: BLE001 - any tool failure is reported
+            if required:
+                rows.append((name, "✘", str(exc), "yes"))
+                missing_required.append(name)
+            else:
+                rows.append((name, "-", f"{exc} (optional)", "no"))
 
     table = Table(box=ROUNDED, header_style="bold cyan", padding=(0, 1))
-    table.add_column("Tool",    style="bold white", width=14)
-    table.add_column("Status",  width=8)
-    table.add_column("Version", style="dim",        width=40)
-    for name, status, version in rows:
+    table.add_column("Tool",     style="bold white", max_width=14)
+    table.add_column("Status",   max_width=8)
+    table.add_column("Version",  style="dim",        max_width=32)
+    table.add_column("Required", style="dim",        max_width=10)
+    for name, status, version, required in rows:
+        color = {"✔": "green", "✘": "red"}.get(status, "dim")
         table.add_row(
-            name,
-            f"[green]{status}[/green]" if status == "✔" else f"[red]{status}[/red]",
-            version,
+            _esc(name), f"[{color}]{status}[/{color}]",
+            _esc(str(version)), required,
         )
     console.print(table)
     _print()
@@ -2201,6 +2820,24 @@ def cmd_doctor() -> None:
             )
             _print(f"{_GREEN}✔{_RESET} Running inside a virtual environment: "
                    f"{_DIM}{venv_path}{_RESET}\n")
+            all_ok = True
+    else:
+        all_ok = True
+
+    if missing_required:
+        all_ok = False
+        _print(
+            f"{_RED}Missing required tool(s):{_RESET} "
+            f"{', '.join(missing_required)}"
+        )
+        _print(f"{_DIM}Install everything with: pip install -r requirements.txt{_RESET}")
+    elif libs_compiler == "cython" and not any(
+        row[0] == "cython" and row[1] == "✔" for row in rows
+    ):
+        _print(
+            f"{_YELLOW}Warning:{_RESET} 'cython' is not available; packages that "
+            "ship bin/libs/*.py cannot be installed."
+        )
 
     if all_ok:
         _print(f"{_GREEN}{_BOLD}✔ All required tools are available.{_RESET}")
@@ -2208,31 +2845,48 @@ def cmd_doctor() -> None:
         _print(f"{_RED}{_BOLD}✘ Some required tools are missing or warnings exist.{_RESET}")
         raise SystemExit(1)
 
+
 def cmd_clean() -> None:
     datac = load_packages()
 
-    known_bin_files: set[str] = set()
+    known_bin_entries: set[str] = set()
     known_lib_names: set[str] = set()
     known_pkg_names: set[str] = set(datac.keys())
 
     for info in datac.values():
-        for f   in info.get("files", []): known_bin_files.add(f)
-        for lib in info.get("libs",  []): known_lib_names.add(f"{lib}.so")
+        for tracked in info.get("files", []):
+            # Tracked files may be nested (data directories); the first path
+            # component is what lives directly inside ~/.weld/bin.
+            known_bin_entries.add(str(tracked).replace("\\", "/").split("/")[0])
+        for lib in info.get("libs", []):
+            known_lib_names.add(f"{lib}.so")
+
+    _JUNK_DIRS = {"__pycache__", ".mypy_cache", ".ruff_cache", ".pytest_cache", "build"}
+    _JUNK_EXTS = {".c", ".spec"}
 
     orphaned_root = [
-        os.path.join(WELD_DIR, e) for e in os.listdir(WELD_DIR)
-        if e not in _WELD_DIR_KNOWN
-    ]
-    orphaned_bin = [
-        os.path.join(WELD_BIN, e) for e in os.listdir(WELD_BIN)
-        if os.path.isfile(os.path.join(WELD_BIN, e)) and e not in known_bin_files
-    ] if os.path.isdir(WELD_BIN) else []
-    orphaned_libs = [
-        os.path.join(WELD_LIBS, e) for e in os.listdir(WELD_LIBS)
-        if os.path.isfile(os.path.join(WELD_LIBS, e)) and e not in known_lib_names
-    ] if os.path.isdir(WELD_LIBS) else []
+        os.path.join(WELD_DIR, entry) for entry in os.listdir(WELD_DIR)
+        if entry not in _WELD_DIR_KNOWN
+        and not entry.startswith(("packages.json.tmp.", "config.toml.tmp."))
+    ] if os.path.isdir(WELD_DIR) else []
 
-    # FIX #9: use explicit suffix checks instead of chained removesuffix
+    orphaned_bin: list[str] = []
+    if os.path.isdir(WELD_BIN):
+        for entry in os.listdir(WELD_BIN):
+            if entry == "libs" or entry in _JUNK_DIRS:
+                continue
+            if entry in known_bin_entries:
+                continue
+            orphaned_bin.append(os.path.join(WELD_BIN, entry))
+
+    orphaned_libs: list[str] = []
+    if os.path.isdir(WELD_LIBS):
+        for entry in os.listdir(WELD_LIBS):
+            if entry in _JUNK_DIRS or any(entry.endswith(ext) for ext in _JUNK_EXTS):
+                continue
+            if entry not in known_lib_names:
+                orphaned_libs.append(os.path.join(WELD_LIBS, entry))
+
     orphaned_readme: list[str] = []
     if os.path.isdir(WELD_README):
         for entry in os.listdir(WELD_README):
@@ -2247,19 +2901,17 @@ def cmd_clean() -> None:
             if pkg not in known_pkg_names:
                 orphaned_readme.append(os.path.join(WELD_README, entry))
 
-    _JUNK_DIRS = {"__pycache__", ".mypy_cache", ".ruff_cache", "build"}
-    _JUNK_EXTS = {".c", ".spec"}
     junk: list[str] = []
     for root, dirs, files in os.walk(WELD_DIR):
-        for d in list(dirs):
-            if d in _JUNK_DIRS:
-                junk.append(os.path.join(root, d))
-                dirs.remove(d)
-        for f in files:
-            if any(f.endswith(ext) for ext in _JUNK_EXTS):
-                junk.append(os.path.join(root, f))
+        for directory in list(dirs):
+            if directory in _JUNK_DIRS:
+                junk.append(os.path.join(root, directory))
+                dirs.remove(directory)
+        for filename in files:
+            if any(filename.endswith(ext) for ext in _JUNK_EXTS):
+                junk.append(os.path.join(root, filename))
 
-    all_targets: list[tuple[str, str]] = (
+    candidates: list[tuple[str, str]] = (
         [(p, "orphaned (root)")     for p in orphaned_root]
         + [(p, "orphaned (bin)")    for p in orphaned_bin]
         + [(p, "orphaned (libs)")   for p in orphaned_libs]
@@ -2267,20 +2919,49 @@ def cmd_clean() -> None:
         + [(p, "junk/cache")        for p in junk]
     )
 
+    # De-duplicate (a path can match several rules) and drop anything that is
+    # nested inside another directory that will be removed anyway.
+    seen: set[str] = set()
+    unique: list[tuple[str, str]] = []
+    for path, reason in candidates:
+        abs_path = os.path.abspath(path)
+        if abs_path in seen:
+            continue
+        seen.add(abs_path)
+        unique.append((path, reason))
+
+    dir_targets = {
+        os.path.abspath(path) for path, _ in unique
+        if os.path.isdir(path) and not os.path.islink(path)
+    }
+    all_targets: list[tuple[str, str]] = []
+    for path, reason in unique:
+        abs_path = os.path.abspath(path)
+        if any(
+            abs_path != directory
+            and abs_path.startswith(directory + os.sep)
+            for directory in dir_targets
+        ):
+            continue
+        all_targets.append((path, reason))
+
     if not all_targets:
         _print(f"{_GREEN}✔{_RESET} {_BOLD}~/.weld is clean — nothing to remove.{_RESET}")
         return
 
+    def display(path: str) -> str:
+        try:
+            rel = os.path.relpath(path, WELD_DIR)
+        except ValueError:
+            return path
+        return path if rel == "." else f"~/.weld/{rel}"
+
     _print(f"\n{_BOLD}{_CYAN}Clean report for ~/.weld{_RESET}\n")
     table = Table(title="Items to remove", box=ROUNDED, header_style="bold cyan", padding=(0, 1))
-    table.add_column("Path",   style="white",  width=60)
-    table.add_column("Reason", style="yellow", width=20)
+    table.add_column("Path",   style="white",  max_width=60)
+    table.add_column("Reason", style="yellow", max_width=20)
     for path, reason in all_targets:
-        try:
-            display = "~/.weld/" + os.path.relpath(path, WELD_DIR)
-        except ValueError:
-            display = path
-        table.add_row(display, reason)
+        table.add_row(display(path), reason)
     console.print(table)
     _print(f"\n{_YELLOW}Total:{_RESET} {len(all_targets)} item(s) will be deleted.")
     _write(f"\n{_BOLD}Proceed? [y/N]:{_RESET} ")
@@ -2298,15 +2979,11 @@ def cmd_clean() -> None:
     removed = 0
     for path, _ in all_targets:
         try:
-            if os.path.isdir(path):
-                shutil.rmtree(path)
-            elif os.path.isfile(path):
+            if os.path.islink(path) or os.path.isfile(path):
                 os.remove(path)
-            try:
-                display = "~/.weld/" + os.path.relpath(path, WELD_DIR)
-            except ValueError:
-                display = path
-            _print(f"  {_YELLOW}Removed:{_RESET} {display}")
+            elif os.path.isdir(path):
+                shutil.rmtree(path)
+            _print(f"  {_YELLOW}Removed:{_RESET} {display(path)}")
             removed += 1
         except OSError as exc:
             _print(f"  {_RED}Failed:{_RESET} {path}  ({exc})")
@@ -2328,13 +3005,14 @@ def cmd_search(query: str) -> None:
         title=f"🔍 Search: '{query}'",
         box=ROUNDED, header_style="bold cyan", padding=(0, 1),
     )
-    table.add_column("Package",     style="bold green", width=20)
-    table.add_column("Version",     style="yellow",     width=10)
-    table.add_column("Description", style="white",      width=40)
-    table.add_column("Readme",      style="dim",        width=8)
+    table.add_column("Package",     style="bold green", max_width=20)
+    table.add_column("Version",     style="yellow",     max_width=10)
+    table.add_column("Description", style="white",      max_width=40)
+    table.add_column("Readme",      style="dim",        max_width=8)
     for name, info in matches.items():
         table.add_row(
-            name, info.get("version", "N/A"), info.get("desc", "-"),
+            _esc(name), _esc(str(info.get("version", "N/A"))),
+            _esc(str(info.get("desc", "-"))),
             "✔" if os.path.isfile(readme_path_for(name)) else "-",
         )
     console.print(table)
@@ -2351,10 +3029,14 @@ def cmd_verify() -> None:
     for pkg_name, info in datac.items():
         missing = []
         for f in info.get("files", []):
-            if not os.path.exists(os.path.join(WELD_BIN, f)):
+            path = _safe_join(WELD_BIN, str(f))
+            if path is None or not os.path.exists(path):
                 missing.append(f"bin/{f}")
+            elif str(f) == pkg_name and not os.access(path, os.X_OK):
+                missing.append(f"bin/{f} (not executable)")
         for lib in info.get("libs", []):
-            if not os.path.exists(os.path.join(WELD_LIBS, f"{lib}.so")):
+            path = _safe_join(WELD_LIBS, f"{lib}.so")
+            if path is None or not os.path.exists(path):
                 missing.append(f"bin/libs/{lib}.so")
         results[pkg_name] = {
             "ok":      len(missing) == 0,
@@ -2372,19 +3054,19 @@ def cmd_verify() -> None:
 
     _print()
     table = Table(title="Verify Summary", box=ROUNDED, header_style="bold cyan", padding=(0, 1))
-    table.add_column("Package", style="bold white", width=20)
-    table.add_column("Status",  width=10)
-    table.add_column("Missing", style="red",  width=30)
-    table.add_column("Readme",  style="dim",  width=8)
+    table.add_column("Package", style="bold white", max_width=20)
+    table.add_column("Status",  max_width=10)
+    table.add_column("Missing", style="red",  max_width=30)
+    table.add_column("Readme",  style="dim",  max_width=8)
 
     all_ok = True
     for pkg_name, res in results.items():
         if not res["ok"]:
             all_ok = False
         table.add_row(
-            pkg_name,
+            _esc(pkg_name),
             "[green]✔ OK[/green]" if res["ok"] else "[red]✘ BROKEN[/red]",
-            ", ".join(res["missing"]) if res["missing"] else "-",
+            _esc(", ".join(res["missing"])) if res["missing"] else "-",
             "✔" if res["readme"] else "-",
         )
     console.print(table)
@@ -2403,33 +3085,41 @@ def cmd_verify() -> None:
 def cmd_addc(pkg_name: str) -> None:
     datac = load_packages()
     if pkg_name not in datac:
-        console.print(f"[red]Error:[/red] Package '{pkg_name}' not found")
+        console.print(f"[red]Error:[/red] Package '{_esc(pkg_name)}' not found")
         raise SystemExit(1)
     libs = datac[pkg_name].get("libs", [])
     if not libs:
-        console.print(f"[yellow]Warning:[/yellow] Package '{pkg_name}' has no libs")
+        console.print(f"[yellow]Warning:[/yellow] Package '{_esc(pkg_name)}' has no libs")
         raise SystemExit(1)
     if not os.path.isfile("config.json"):
         console.print("[red]Error:[/red] Not in a weld project directory")
         raise SystemExit(1)
     os.makedirs(os.path.join("bin", "libs"), exist_ok=True)
+    copied = 0
     for lib in libs:
-        src = os.path.join(WELD_LIBS, f"{lib}.so")
-        dst = os.path.join("bin", "libs", f"{lib}.so")
-        if not os.path.exists(src):
-            console.print(f"[red]Error:[/red] {lib}.so not found in installed package")
+        src_path = _safe_join(WELD_LIBS, f"{lib}.so")
+        dst_path = _safe_join(os.path.join("bin", "libs"), f"{lib}.so")
+        if src_path is None or dst_path is None:
+            console.print(f"[red]Error:[/red] Invalid library name '{_esc(lib)}'")
+            raise SystemExit(1)
+        if not os.path.isfile(src_path):
+            console.print(f"[red]Error:[/red] {_esc(lib)}.so not found in installed package")
             raise SystemExit(1)
         with spinner(f"Copying {lib}.so -> bin/libs/"):
-            shutil.copy(src, dst)
+            shutil.copy2(src_path, dst_path)
+        copied += 1
+    _print(f"{_GREEN}✔{_RESET} Copied {copied} lib(s) into bin/libs/")
 
 
 def cmd_completions_zsh() -> None:
     helper_path = os.path.join(WELD_DIR, "_complete_packages.py")
-    with open(helper_path, "w") as fp:
-        fp.write(
-            f"import json\nwith open('{WELD_PACKAGES}') as f:\n"
-            f"    d = json.load(f)\nprint('\\n'.join(d.keys()))\n"
-        )
+    _atomic_write(
+        helper_path,
+        "import json\n"
+        f"with open({WELD_PACKAGES!r}) as f:\n"
+        "    d = json.load(f)\n"
+        "print('\\n'.join(d.keys()))\n",
+    )
 
     template_names = " ".join(
         os.path.splitext(f)[0]
@@ -2476,7 +3166,7 @@ _weld() {{
 
 _weld_packages() {{
     local packages
-    packages=(${{(f)"$(python {helper_path} 2>/dev/null)"}})
+    packages=(${{(f)"$({shlex.quote(sys.executable)} {shlex.quote(helper_path)} 2>/dev/null)"}})
     _describe 'packages' packages
 }}
 
@@ -2520,11 +3210,11 @@ def main() -> None:
     parser.add_argument("--addc",         metavar="<package>")
     parser.add_argument("--pin",          metavar="<package>")
     parser.add_argument("--unpin",        metavar="<package>")
-    parser.add_argument("--note",         metavar="<package>",   nargs=2)
+    parser.add_argument("--note",         metavar="<package>",   nargs="+")
     parser.add_argument("--rename",       metavar="<package>",   nargs=2)
     parser.add_argument("--duplicate",    metavar="<package>",   nargs=2)
     parser.add_argument("--edit",         metavar="<package>")
-    parser.add_argument("--history",      metavar="<package>",   nargs="?", const="__ALL__")
+    parser.add_argument("--history",      metavar="<package>",   nargs="?", const="")
     parser.add_argument("--stats",        action="store_true")
     parser.add_argument("--doctor",       action="store_true")
     parser.add_argument("--template",     metavar="<name>")
@@ -2536,19 +3226,19 @@ def main() -> None:
     try:
         if args.version:
             _print(f"weld {_CYAN}{_BOLD}{VERSION}{_RESET}")
-        elif args.list:
+        elif args.list or args.list_filter or args.list_sort != "name":
             cmd_list(sort_by=args.list_sort, filter_pat=args.list_filter)
-        elif args.build:
+        elif args.build is not None:
             cmd_build(args.build)
-        elif args.install:
+        elif args.install is not None:
             cmd_install(args.install)
-        elif args.update:
+        elif args.update is not None:
             cmd_update(args.update)
-        elif args.new:
+        elif args.new is not None:
             cmd_new(args.new)
-        elif args.remove:
+        elif args.remove is not None:
             cmd_remove(args.remove)
-        elif args.info:
+        elif args.info is not None:
             cmd_info(args.info)
         elif args.run is not None:
             if not args.run:
@@ -2559,42 +3249,48 @@ def main() -> None:
                 )
                 raise SystemExit(1)
             cmd_run(args.run[0], args.run[1:])
-        elif args.search:
+        elif args.search is not None:
             cmd_search(args.search)
         elif args.verify:
             cmd_verify()
         elif args.clean:
             cmd_clean()
-        elif args.addc:
+        elif args.addc is not None:
             cmd_addc(args.addc)
-        elif args.pin:
+        elif args.pin is not None:
             cmd_pin(args.pin)
-        elif args.unpin:
+        elif args.unpin is not None:
             cmd_unpin(args.unpin)
-        elif args.note:
-            cmd_note(args.note[0], args.note[1])
-        elif args.rename:
+        elif args.note is not None:
+            if len(args.note) < 2:
+                console.print(
+                    "[red]Error:[/red] --note requires a package name and a note. "
+                    "Example: weld --note mypkg 'my note'"
+                )
+                raise SystemExit(1)
+            cmd_note(args.note[0], " ".join(args.note[1:]))
+        elif args.rename is not None:
             cmd_rename(args.rename[0], args.rename[1])
-        elif args.duplicate:
+        elif args.duplicate is not None:
             cmd_duplicate(args.duplicate[0], args.duplicate[1])
-        elif args.edit:
+        elif args.edit is not None:
             cmd_edit(args.edit)
         elif args.history is not None:
-            cmd_history(None if args.history == "__ALL__" else args.history)
+            cmd_history(args.history or None)
         elif args.stats:
             cmd_stats()
         elif args.doctor:
             cmd_doctor()
-        elif args.template:
+        elif args.template is not None:
             cmd_template(args.template)
         elif args.templates:
             cmd_template_list()
-        elif args.completions:
+        elif args.completions is not None:
             if args.completions == "zsh":
                 cmd_completions_zsh()
             else:
                 console.print(
-                    f"[red]Error:[/red] Unknown shell '{args.completions}' "
+                    f"[red]Error:[/red] Unknown shell '{_esc(args.completions)}' "
                     "(supported: zsh)"
                 )
                 raise SystemExit(1)
@@ -2604,6 +3300,17 @@ def main() -> None:
     except KeyboardInterrupt:
         _write(_SHOW_CURSOR)
         _print(f"\n{_YELLOW}Aborted.{_RESET}")
+        raise SystemExit(1)
+    except BrokenPipeError:
+        # Output was piped into e.g. `head`; exit quietly.
+        try:
+            devnull = os.open(os.devnull, os.O_WRONLY)
+            os.dup2(devnull, sys.stdout.fileno())
+        except OSError:
+            pass
+        raise SystemExit(0)
+    except OSError as exc:
+        console.print(f"[red]Error:[/red] {_esc(str(exc))}")
         raise SystemExit(1)
 
 
