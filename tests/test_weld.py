@@ -76,6 +76,29 @@ echo "compiler exploded" >&2
 exit 1
 """
 
+# Like _FAKE_NUITKA, but appends its argv (one JSON list per line) to the
+# file named by $WELD_NUITKA_ARGS so tests can assert which options weld
+# passed to the compiler.
+_RECORDING_NUITKA = """#!/usr/bin/env python3
+import json, os, sys
+
+if "--version" in sys.argv:
+    print("fake-nuitka 1.0")
+    sys.exit(0)
+
+record = os.environ.get("WELD_NUITKA_ARGS")
+if record:
+    with open(record, "a") as f:
+        f.write(json.dumps(sys.argv[1:]) + "\\n")
+
+src = sys.argv[-1]
+stem = os.path.splitext(os.path.basename(src))[0]
+out = os.path.join(os.path.dirname(os.path.abspath(src)), stem + ".bin")
+with open(out, "w") as f:
+    f.write('#!/bin/sh\\necho compiled-' + stem + ' "$@"\\n')
+os.chmod(out, 0o755)
+"""
+
 
 def _write_exe(path: Path, content: str) -> None:
     path.write_text(content, encoding="utf-8")
@@ -167,12 +190,16 @@ class WeldRunner:
             "libs_compiler": "cython",
             "default_version": "1.0.0",
             "auto_pip_install": True,
+            "nuitka_opts": [],
+            "ruff_opts": ["--no-cache", "--output-format=concise"],
         }
         defaults.update(settings)
         lines = ["[weld]"]
         for key, value in defaults.items():
             if isinstance(value, bool):
                 rendered = "true" if value else "false"
+            elif isinstance(value, list):
+                rendered = "[" + ", ".join(json.dumps(v) for v in value) + "]"
             else:
                 rendered = f'"{value}"'
             lines.append(f"{key} = {rendered}")
@@ -232,7 +259,8 @@ def make_archive(path: Path, config: dict, files: dict[str, str] | None = None) 
 def test_version(weld: WeldRunner) -> None:
     result = weld.ok("--version")
     assert "weld" in result.stdout
-    # VERSION is now 0.2.0 (synced with repo's version file); don't hardcode
+    # Don't hardcode the release here; test_version_matches_version_file
+    # checks weld.py's VERSION against the repo's version file.
     assert "0." in result.stdout or "1." in result.stdout or "2." in result.stdout
 
 
@@ -840,3 +868,135 @@ def test_completions_uses_current_interpreter(weld: WeldRunner) -> None:
 
 def test_unknown_shell_is_rejected(weld: WeldRunner) -> None:
     assert "Unknown shell" in weld.fail("--completions", "fish").stdout
+
+
+# ---------------------------------------------------------------------------
+# saved tool options (-Wnuitka / -Enuitka / -Wruff / -Eruff)
+# ---------------------------------------------------------------------------
+
+def _config_text(weld: WeldRunner) -> str:
+    return (weld.home / ".weld" / "config.toml").read_text(encoding="utf-8")
+
+
+def _write_f401_project(weld: WeldRunner, name: str = "app") -> Path:
+    project = weld.new(name)
+    (project / "bin" / "main.py").write_text(
+        "import os\n\nprint('hi')\n", encoding="utf-8"
+    )
+    return project
+
+
+def test_version_matches_version_file(weld: WeldRunner) -> None:
+    version = (REPO_ROOT / "version").read_text(encoding="utf-8").strip()
+    assert version in weld.ok("--version").stdout
+
+
+def test_help_lists_tool_opt_flags(weld: WeldRunner) -> None:
+    result = weld.ok("--help")
+    for flag in ("-Wnuitka", "-Enuitka", "-Wruff", "-Eruff"):
+        assert flag in result.stdout
+
+
+def test_wruff_adds_option_and_build_uses_it(weld: WeldRunner) -> None:
+    _write_f401_project(weld)
+    assert "Ruff check failed" in weld.fail("--build", "app").stdout
+
+    result = weld.ok("-Wruff", "--ignore=F401")
+    assert "Added ruff option: --ignore=F401" in result.stdout
+    assert "--ignore=F401" in _config_text(weld)
+
+    weld.build("app")  # the saved option makes the F401 violation pass
+
+    result = weld.ok("-Eruff", "--ignore=F401")
+    assert "Removed ruff option: --ignore=F401" in result.stdout
+    assert "--ignore=F401" not in _config_text(weld)
+    assert "Ruff check failed" in weld.fail("--build", "app").stdout
+
+
+def test_tool_opts_combined_with_build_apply_immediately(weld: WeldRunner) -> None:
+    _write_f401_project(weld)
+    weld.ok("--build", "app", "-Wruff", "--ignore=F401")
+    assert (weld.root / "app.wld").is_file()
+    weld.build("app")  # ... and the option stayed saved for later runs
+
+
+def test_eruff_can_remove_a_default_option(weld: WeldRunner) -> None:
+    result = weld.ok("-Eruff", "--no-cache")
+    assert "Removed ruff option: --no-cache" in result.stdout
+    assert "not found" not in result.stdout
+    weld.new("app")
+    weld.build("app")
+
+
+def test_eruff_missing_option_warns(weld: WeldRunner) -> None:
+    result = weld.ok("-Eruff", "--ignore=E501")
+    assert "Warning" in result.stdout
+    assert "not found" in result.stdout
+
+
+def test_enuitka_missing_option_warns(weld: WeldRunner) -> None:
+    result = weld.ok("-Enuitka", "--standalone")
+    assert "Warning" in result.stdout
+    assert "not found" in result.stdout
+
+
+def test_wruff_duplicate_option_warns_and_is_stored_once(weld: WeldRunner) -> None:
+    weld.ok("-Wruff", "--ignore=F401")
+    result = weld.ok("-Wruff=--ignore=F401")  # also exercises the = spelling
+    assert "already present" in result.stdout
+    assert _config_text(weld).count("--ignore=F401") == 1
+
+
+def test_tool_opt_empty_value_is_an_error(weld: WeldRunner) -> None:
+    assert "Error" in weld.fail("-Wnuitka", "").stdout
+    assert "Error" in weld.fail("-Eruff", "   ").stdout
+
+
+def test_tool_opts_from_config_file_are_used(weld: WeldRunner) -> None:
+    _write_f401_project(weld)
+    weld.set_config(
+        ruff_opts=["--no-cache", "--output-format=concise", "--ignore=F401"]
+    )
+    weld.build("app")
+
+
+def test_wnuitka_options_reach_compiler_and_enuitka_removes_them(
+    weld: WeldRunner,
+) -> None:
+    weld.new("app")
+    archive = weld.build("app")
+
+    recbin = weld.root / "recbin"
+    recbin.mkdir()
+    _write_exe(recbin / "nuitka", _RECORDING_NUITKA)
+    record = weld.root / "nuitka-args.log"
+    run_kwargs = {
+        "path": f"{recbin}:{weld.env['PATH']}",
+        "extra_env": {"WELD_NUITKA_ARGS": str(record)},
+    }
+
+    def recorded_calls() -> list[list[str]]:
+        return [
+            json.loads(line)
+            for line in record.read_text(encoding="utf-8").splitlines()
+            if line.strip()
+        ]
+
+    # One quoted string holding two options is split into two saved options.
+    weld.ok("-Wnuitka", "--weld-test-opt=abc --jobs=4")
+    assert "--weld-test-opt=abc" in _config_text(weld)
+    assert "--jobs=4" in _config_text(weld)
+
+    weld.install(archive, **run_kwargs)
+    calls = recorded_calls()
+    assert calls, "fake nuitka was never invoked"
+    assert "--weld-test-opt=abc" in calls[-1]
+    assert "--jobs=4" in calls[-1]
+    assert calls[-1][-1].endswith("app.py")  # options go before the source
+
+    weld.ok("-Enuitka", "--jobs=4")
+    record.write_text("", encoding="utf-8")
+    weld.install(archive, **run_kwargs)
+    calls = recorded_calls()
+    assert calls and "--jobs=4" not in calls[-1]
+    assert "--weld-test-opt=abc" in calls[-1]

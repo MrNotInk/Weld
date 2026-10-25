@@ -46,7 +46,7 @@ except ImportError:
 
 console = Console()
 
-VERSION = "0.3.0"
+VERSION = "0.4.0"
 
 WELD_DIR       = os.path.expanduser("~/.weld")
 WELD_BIN       = os.path.join(WELD_DIR, "bin")
@@ -82,12 +82,22 @@ _WELD_DIR_KNOWN = {
     "plugins", "templates",
 }
 
+# Default extra options passed to the external tools.  Users manage these
+# with -Wnuitka / -Enuitka / -Wruff / -Eruff (or by editing config.toml).
+_DEFAULT_NUITKA_OPTS: list[str] = []
+_DEFAULT_RUFF_OPTS: list[str] = ["--no-cache", "--output-format=concise"]
+
+# CLI flags that add (-W...) or remove (-E...) saved tool options.
+_TOOL_OPT_FLAGS = ("-Wnuitka", "-Enuitka", "-Wruff", "-Eruff")
+
 DEFAULT_CONFIG = {
     "weld": {
         "compiler":         "nuitka",
         "libs_compiler":    "cython",
         "default_version":  "1.0.0",
         "auto_pip_install": True,
+        "nuitka_opts":      list(_DEFAULT_NUITKA_OPTS),
+        "ruff_opts":        list(_DEFAULT_RUFF_OPTS),
     }
 }
 
@@ -1239,6 +1249,160 @@ def get_auto_pip_install() -> bool:
 
 
 # ---------------------------------------------------------------------------
+# Saved tool options (-Wnuitka / -Enuitka / -Wruff / -Eruff)
+# ---------------------------------------------------------------------------
+
+_TOOL_OPT_CONFIG_KEYS = {"nuitka": "nuitka_opts", "ruff": "ruff_opts"}
+_TOOL_OPT_DEFAULTS = {"nuitka": _DEFAULT_NUITKA_OPTS, "ruff": _DEFAULT_RUFF_OPTS}
+_TOOL_OPT_EXAMPLES = {"nuitka": "--standalone", "ruff": "--ignore=F401"}
+
+
+def _get_tool_opts(tool: str) -> list[str]:
+    """Return the saved extra options for *tool* ("nuitka" or "ruff").
+
+    Reads ``nuitka_opts`` / ``ruff_opts`` from the ``[weld]`` section of
+    ``~/.weld/config.toml``.  The value may be a list of option strings or a
+    single shell-style string; each entry is split with :mod:`shlex` so
+    ``"--jobs=4 --quiet"`` counts as two options.  Missing or invalid
+    values fall back to the built-in defaults (with a warning).
+    """
+    key = _TOOL_OPT_CONFIG_KEYS[tool]
+    defaults = list(_TOOL_OPT_DEFAULTS[tool])
+    settings = _weld_settings()
+    if key not in settings:
+        return defaults
+
+    raw = settings[key]
+    entries: list[str]
+    if isinstance(raw, str):
+        entries = [raw]
+    elif isinstance(raw, list):
+        entries = []
+        for item in raw:
+            if isinstance(item, str):
+                entries.append(item)
+            else:
+                _print(
+                    f"{_YELLOW}Warning:{_RESET} Ignoring non-string entry "
+                    f"{item!r} in '{key}'"
+                )
+    else:
+        _print(
+            f"{_YELLOW}Warning:{_RESET} Invalid '{key}' in config "
+            f"(expected a list of strings), using defaults"
+        )
+        return defaults
+
+    opts: list[str] = []
+    try:
+        for entry in entries:
+            opts.extend(shlex.split(entry))
+    except ValueError as exc:
+        _print(
+            f"{_YELLOW}Warning:{_RESET} Could not parse '{key}' in config "
+            f"({exc}), using defaults"
+        )
+        return defaults
+    return opts
+
+
+def get_nuitka_opts() -> list[str]:
+    return _get_tool_opts("nuitka")
+
+
+def get_ruff_opts() -> list[str]:
+    return _get_tool_opts("ruff")
+
+
+def _save_tool_opts(tool: str, opts: list[str]) -> None:
+    """Persist *opts* for *tool* in ``~/.weld/config.toml``."""
+    key = _TOOL_OPT_CONFIG_KEYS[tool]
+    config = load_config()
+    weld_cfg = config.get("weld")
+    weld_cfg = dict(weld_cfg) if isinstance(weld_cfg, dict) else {}
+    weld_cfg[key] = list(opts)
+    config["weld"] = weld_cfg
+    try:
+        _atomic_write(WELD_CONFIG, tomli_w.dumps(config))
+    except (OSError, TypeError, ValueError) as exc:
+        console.print(
+            f"[red]Error:[/red] Could not write {_esc(WELD_CONFIG)}: {_esc(str(exc))}"
+        )
+        raise SystemExit(1)
+
+
+def _parse_cli_opts(flag: str, tool: str, values: list[str]) -> list[str]:
+    """Split the raw string(s) given to *-flag* into individual options."""
+    tokens: list[str] = []
+    for value in values:
+        try:
+            parts = shlex.split(value)
+        except ValueError as exc:
+            console.print(
+                f"[red]Error:[/red] Could not parse {flag} value "
+                f"{_esc(repr(value))}: {_esc(str(exc))}"
+            )
+            raise SystemExit(1)
+        if not parts:
+            console.print(
+                f'[red]Error:[/red] {flag} needs a non-empty option, '
+                f'e.g. {flag} "{_TOOL_OPT_EXAMPLES[tool]}"'
+            )
+            raise SystemExit(1)
+        tokens.extend(parts)
+    return tokens
+
+
+def _apply_tool_opt_changes(
+    tool: str, add_values: list[str], remove_values: list[str]
+) -> bool:
+    """Apply -W<tool> / -E<tool> requests to the saved options for *tool*.
+
+    Removals are processed before additions.  Removing an option that is
+    not saved (or adding one that already is) prints a warning and leaves
+    the saved list unchanged for that option.  Returns True when any
+    -W/-E flag for *tool* was given.
+    """
+    if not add_values and not remove_values:
+        return False
+
+    remove_tokens = _parse_cli_opts(f"-E{tool}", tool, remove_values)
+    add_tokens = _parse_cli_opts(f"-W{tool}", tool, add_values)
+
+    opts = _get_tool_opts(tool)
+    changed = False
+
+    for token in remove_tokens:
+        if token in opts:
+            opts = [opt for opt in opts if opt != token]
+            changed = True
+            _print(f"{_GREEN}✔{_RESET} Removed {tool} option: {token}")
+        else:
+            _print(
+                f"{_YELLOW}Warning:{_RESET} {tool} option '{token}' "
+                f"not found, nothing to remove"
+            )
+
+    for token in add_tokens:
+        if token in opts:
+            _print(
+                f"{_YELLOW}Warning:{_RESET} {tool} option '{token}' "
+                f"already present, not adding again"
+            )
+        else:
+            opts.append(token)
+            changed = True
+            _print(f"{_GREEN}✔{_RESET} Added {tool} option: {token}")
+
+    if changed:
+        _save_tool_opts(tool, opts)
+
+    current = shlex.join(opts) if opts else "(none)"
+    _print(f"{_DIM}Current {tool} options: {current}  (config: {WELD_CONFIG}){_RESET}")
+    return True
+
+
+# ---------------------------------------------------------------------------
 # Helpers
 # ---------------------------------------------------------------------------
 
@@ -1312,10 +1476,18 @@ def save_packages(data: dict) -> None:
         raise SystemExit(1)
 
 
-def ruff_check(path: str, cwd: str | None = None) -> tuple[bool, str]:
-    """Run ruff on *path*; returns (ok, combined output)."""
+def ruff_check(
+    path: str, cwd: str | None = None, opts: list[str] | None = None
+) -> tuple[bool, str]:
+    """Run ruff on *path*; returns (ok, combined output).
+
+    *opts* are the extra ``ruff check`` options (managed with -Wruff /
+    -Eruff); when omitted the saved options from the config are used.
+    """
+    if opts is None:
+        opts = get_ruff_opts()
     result = subprocess.run(
-        ["ruff", "check", "--no-cache", "--output-format=concise", path],
+        ["ruff", "check", *opts, path],
         cwd=cwd, capture_output=True, text=True, check=False,
     )
     output = (result.stdout or "") + (result.stderr or "")
@@ -1421,17 +1593,22 @@ def remove_changelog(pkg_name: str, silent: bool = False) -> None:
 def compile_py_nuitka(
     full_path: str, cwd: str,
     line_cb = None,
+    opts: list[str] | None = None,
 ) -> subprocess.CompletedProcess:
     """
     Compile *full_path* with Nuitka.
     *full_path* must be an absolute path to the .py file.
     If *line_cb* is provided, each stderr line (stripped) is passed to it live.
+    *opts* are the extra Nuitka options (managed with -Wnuitka / -Enuitka);
+    when omitted the saved options from the config are used.
     """
     if not os.path.isabs(full_path):
         full_path = os.path.join(cwd, full_path)
+    if opts is None:
+        opts = get_nuitka_opts()
 
     proc = subprocess.Popen(
-        ["nuitka", full_path],
+        ["nuitka", *opts, full_path],
         cwd=cwd,
         stdout=subprocess.DEVNULL,
         stderr=subprocess.PIPE,
@@ -1482,13 +1659,21 @@ def compile_py_pyinstaller(full_path: str, cwd: str) -> subprocess.CompletedProc
     return result
 
 
-def _compile_nuitka_live(full_path: str, cwd: str, label: str) -> subprocess.CompletedProcess:
-    """Compile with Nuitka showing a live spinner + last stderr line, truncated to term width - 2."""
+def _compile_nuitka_live(
+    full_path: str, cwd: str, label: str, opts: list[str] | None = None
+) -> subprocess.CompletedProcess:
+    """Compile with Nuitka showing a live spinner + last stderr line, truncated to term width - 2.
+
+    *opts* are the extra Nuitka options (managed with -Wnuitka / -Enuitka);
+    when omitted the saved options from the config are used.
+    """
     term_w = shutil.get_terminal_size().columns
     max_vis = term_w - 2
+    if opts is None:
+        opts = get_nuitka_opts()
 
     proc = subprocess.Popen(
-        ["nuitka", full_path],
+        ["nuitka", *opts, full_path],
         cwd=cwd, stdout=subprocess.DEVNULL, stderr=subprocess.PIPE, text=True,
     )
 
@@ -1739,7 +1924,11 @@ def cmd_build(directory: str) -> None:
 
     _require_tool("ruff", "Install it with: pip install ruff")
 
+    ruff_opts = get_ruff_opts()
+
     _print(f"\n{_BOLD}{_CYAN}Running validators...{_RESET}")
+    if ruff_opts:
+        _print(f"{_DIM}ruff options: {shlex.join(ruff_opts)}{_RESET}")
 
     bin_files  = filter_files(bin_dir,  ".py")
     libs_files = filter_files(libs_dir, ".py")
@@ -1753,7 +1942,7 @@ def cmd_build(directory: str) -> None:
     try:
         for idx, (display, label, full) in enumerate(targets, 1):
             _progress(idx, total, f"validating  {label}")
-            ruff_ok, output = ruff_check(full, cwd=directory)
+            ruff_ok, output = ruff_check(full, cwd=directory, opts=ruff_opts)
             if not ruff_ok:
                 _progress_done()
                 console.print(f"[red]Error:[/red] Ruff check failed for {_esc(display)}")
@@ -1899,6 +2088,7 @@ def cmd_install(wld_file: str, log_action: bool = True) -> None:
 
     compiler      = get_compiler()
     libs_compiler = get_libs_compiler()
+    nuitka_opts   = get_nuitka_opts() if compiler == "nuitka" else []
 
     with tempfile.TemporaryDirectory(prefix="weld-install-") as tmp:
         with spinner("Extracting wld archive"):
@@ -1927,12 +2117,14 @@ def cmd_install(wld_file: str, log_action: bool = True) -> None:
             else:
                 _require_tool("pyinstaller", "Install it with: pip install pyinstaller")
             _print(f"\n{_BOLD}{_CYAN}Compiling with {compiler}...{_RESET}")
+            if compiler == "nuitka" and nuitka_opts:
+                _print(f"{_DIM}nuitka options: {shlex.join(nuitka_opts)}{_RESET}")
             try:
                 for idx, py_file in enumerate(py_files, 1):
                     full = os.path.join(tmp_bin, py_file)
                     _progress(idx, len(py_files), py_file)
                     if compiler == "nuitka":
-                        result = _compile_nuitka_live(full, tmp_bin, py_file)
+                        result = _compile_nuitka_live(full, tmp_bin, py_file, opts=nuitka_opts)
                     else:
                         with spinner(f"{compiler}  {py_file}"):
                             result = compile_py_pyinstaller(full, tmp_bin)
@@ -2733,6 +2925,8 @@ def cmd_stats() -> None:
     table.add_row("Templates available", str(n_templates))
     table.add_row("Compiler",            cfg.get("compiler",      "nuitka"))
     table.add_row("Libs compiler",       cfg.get("libs_compiler", "cython"))
+    table.add_row("Nuitka options",      shlex.join(get_nuitka_opts()) or "-")
+    table.add_row("Ruff options",        shlex.join(get_ruff_opts()) or "-")
     table.add_row("weld version",         VERSION)
     table.add_row("Python",              sys.version.split()[0])
     table.add_row("Platform",            sys.platform)
@@ -2805,6 +2999,8 @@ def cmd_doctor() -> None:
             _esc(str(version)), required,
         )
     console.print(table)
+    _print(f"{_DIM}nuitka options: {shlex.join(get_nuitka_opts()) or '(none)'}{_RESET}")
+    _print(f"{_DIM}ruff options:   {shlex.join(get_ruff_opts()) or '(none)'}{_RESET}")
     _print()
 
     # ------------------------------------------------------------------ #
@@ -3174,6 +3370,10 @@ _weld() {{
         '--template[Apply a template to current project]:template:({template_names})'
         '--templates[List available templates]'
         '--completions[Print completions]:shell:(zsh)'
+        '-Wnuitka[Add Nuitka option(s), saved to config]:opt:'
+        '-Enuitka[Remove Nuitka option(s) from config]:opt:'
+        '-Wruff[Add Ruff option(s), saved to config]:opt:'
+        '-Eruff[Remove Ruff option(s) from config]:opt:'
         '--version[Show version]'
         '(-h --help){{-h,--help}}[Show help]'
     )
@@ -3998,6 +4198,30 @@ def cmd_self_upgrade(force: bool = False, yes: bool = False) -> None:
 # Entry point
 # ---------------------------------------------------------------------------
 
+def _preprocess_tool_opt_args(argv: list[str]) -> list[str]:
+    """Rewrite ``-Wnuitka <opt>``-style pairs as ``-Wnuitka=<opt>``.
+
+    Tool options almost always start with ``-`` (e.g. ``--standalone``),
+    which argparse would otherwise refuse as the value of a separate
+    argument.  Everything from ``--run`` onwards is left untouched because
+    it is forwarded to the installed binary unchanged.
+    """
+    out: list[str] = []
+    i = 0
+    while i < len(argv):
+        token = argv[i]
+        if token == "--run":
+            out.extend(argv[i:])
+            break
+        if token in _TOOL_OPT_FLAGS and i + 1 < len(argv):
+            out.append(f"{token}={argv[i + 1]}")
+            i += 2
+            continue
+        out.append(token)
+        i += 1
+    return out
+
+
 def main() -> None:
     bootstrap()
 
@@ -4006,7 +4230,10 @@ def main() -> None:
         description=f"weld — fixes the mess of Python app distribution  v{VERSION}",
         epilog=(
             "NOTE: --run must be the last flag; everything after the package name "
-            "is forwarded to the binary.  Example: weld --run mypkg --verbose"
+            "is forwarded to the binary.  Example: weld --run mypkg --verbose\n"
+            "Tool options: -Wnuitka/-Wruff add and -Enuitka/-Eruff remove saved "
+            "Nuitka/Ruff options in ~/.weld/config.toml; they can be used alone "
+            "or combined with --build/--install/--update and apply immediately."
         ),
     )
 
@@ -4041,10 +4268,25 @@ def main() -> None:
     parser.add_argument("--check-update", action="store_true", help="Check if a newer weld version is available")
     parser.add_argument("--yes",          action="store_true", help="Auto-confirm prompts (for --self-upgrade)")
     parser.add_argument("--force",        action="store_true", help="Force reinstall even if already on latest (for --self-upgrade)")
+    parser.add_argument("-Wnuitka", dest="wnuitka", metavar="<opt>", action="append", default=[],
+                        help='Add Nuitka option(s), e.g. -Wnuitka "--standalone" (repeatable; saved to config)')
+    parser.add_argument("-Enuitka", dest="enuitka", metavar="<opt>", action="append", default=[],
+                        help="Remove saved Nuitka option(s) (warns if an option is not found)")
+    parser.add_argument("-Wruff",   dest="wruff",   metavar="<opt>", action="append", default=[],
+                        help='Add Ruff option(s), e.g. -Wruff "--ignore=F401" (repeatable; saved to config)')
+    parser.add_argument("-Eruff",   dest="eruff",   metavar="<opt>", action="append", default=[],
+                        help='Remove saved Ruff option(s), e.g. -Eruff "--no-cache" (warns if not found)')
 
-    args = parser.parse_args()
+    args = parser.parse_args(_preprocess_tool_opt_args(sys.argv[1:]))
 
     try:
+        # Apply -W/-E tool-option changes first so a combined command
+        # (e.g. `weld --build app -Wruff "--ignore=F401"`) uses them now.
+        handled_tool_opts = _apply_tool_opt_changes("nuitka", args.wnuitka, args.enuitka)
+        handled_tool_opts = (
+            _apply_tool_opt_changes("ruff", args.wruff, args.eruff) or handled_tool_opts
+        )
+
         if args.version:
             _print(f"weld {_CYAN}{_BOLD}{VERSION}{_RESET}")
         elif args.list or args.list_filter or args.list_sort != "name":
@@ -4119,6 +4361,8 @@ def main() -> None:
             cmd_self_upgrade(force=args.force, yes=args.yes)
         elif args.check_update:
             cmd_check_update()
+        elif handled_tool_opts:
+            pass  # only -W/-E flags were given; the config is already updated
         else:
             parser.print_help()
 
