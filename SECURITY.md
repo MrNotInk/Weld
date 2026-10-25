@@ -2,10 +2,10 @@
 
 ## Supported Versions
 
-currently we are starting so it is also supported
+currently we are starting so it is also supported every version
 
 ## Reporting a Vulnerability
 
 You can directly tell us the vulnerability here
 
-You can expect One Mounth every major update
+You can expect One Month every major update
