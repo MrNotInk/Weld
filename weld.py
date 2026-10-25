@@ -3348,10 +3348,16 @@ def _get_release_urls() -> tuple[str, str]:
     return RELEASE_VERSION_URL, RELEASE_WELD_URL
 
 
-def _clone_repo_and_get_weld(version_only: bool = False) -> tuple[str, bytes | None]:
+def _strip_py_suffix(name: str) -> str:
+    """If *name* ends with .py, strip it (weld.py → weld)."""
+    return name[:-3] if name.endswith(".py") else name
+
+
+def _clone_repo_and_get_weld(version_only: bool = False) -> tuple[str, bytes | None, str]:
     """
     Clone the weld git repo shallowly and extract version + weld bytes.
-    Returns (version, data) where data is the raw weld.py bytes (or None if version_only).
+    Returns (version, data, source_name) where source_name is e.g. 'weld.py' or 'weld'
+    and data is the raw bytes (or None if version_only).
     Env overrides:
       WELD_GIT_URL     – repo URL (default https://github.com/MrNotInk/Weld.git)
       WELD_GIT_BRANCH  – branch/tag to clone (default main)
@@ -3386,9 +3392,17 @@ def _clone_repo_and_get_weld(version_only: bool = False) -> tuple[str, bytes | N
         else:
             raise RuntimeError(f"git clone failed: {(result.stderr or result.stdout).strip()[:500]}")
 
-        weld_py = os.path.join(clone_dir, "weld.py")
+        # Prefer weld.py (canonical) but also support plain "weld" binary in repo
+        for candidate in ("weld.py", "weld"):
+            cand_path = os.path.join(clone_dir, candidate)
+            if os.path.isfile(cand_path):
+                weld_py = cand_path
+                break
+        else:
+            raise RuntimeError("No weld or weld.py found in cloned repo")
         with open(weld_py, "rb") as fp:
             data = fp.read()
+        source_name = os.path.basename(weld_py)
 
         # Extract VERSION = "x.y.z"
         m = re.search(br'VERSION\s*=\s*["\']([^"\']+)["\']', data)
@@ -3397,8 +3411,8 @@ def _clone_repo_and_get_weld(version_only: bool = False) -> tuple[str, bytes | N
         version = m.group(1).decode("utf-8", errors="replace").strip()
 
         if version_only:
-            return version, None
-        return version, data
+            return version, None, source_name
+        return version, data, source_name
 
     finally:
         # cleanup clone
@@ -3620,7 +3634,7 @@ def cmd_check_update() -> None:
         _print(f"{_DIM}Trying git clone from {git_url} ...{_RESET}")
         try:
             with spinner(f"Cloning {WELD_REPO}"):
-                remote_version, _ = _clone_repo_and_get_weld(version_only=True)
+                remote_version, _, _ = _clone_repo_and_get_weld(version_only=True)
             source = f"git:{git_url}"
             _print(f"{_DIM}Got version via git clone: {remote_version}{_RESET}")
         except Exception as exc:
@@ -3686,13 +3700,19 @@ def cmd_self_upgrade(force: bool = False, yes: bool = False) -> None:
         _print(f"{_DIM}Method: git clone {git_url}{_RESET}")
         try:
             with spinner(f"Cloning {WELD_REPO}"):
-                remote_version, data = _clone_repo_and_get_weld(version_only=False)
-            source_desc = f"git clone {git_url}"
+                remote_version, data, source_name = _clone_repo_and_get_weld(version_only=False)
+            # If source ends with .py → strip and remember to exclude .py artifact
+            if source_name.endswith(".py"):
+                _print(f"{_DIM}Source {source_name} ends with .py → will install as {_strip_py_suffix(source_name)} (exclude .py){_RESET}")
+            source_desc = f"git clone {git_url} ({source_name} → {_strip_py_suffix(source_name)})"
             _print(f"{_DIM}Cloned version {remote_version} ({len(data) if data else 0} bytes){_RESET}")
         except Exception as exc:
             _print(f"{_YELLOW}Git clone failed:{_RESET} {exc}")
             _print(f"{_DIM}Falling back to releases...{_RESET}")
             use_git = False
+            source_name = ""  # for later logic
+    else:
+        source_name = ""
 
     if not use_git:
         version_url, weld_url = _get_release_urls()
@@ -3760,6 +3780,11 @@ def cmd_self_upgrade(force: bool = False, yes: bool = False) -> None:
     else:
         # Download weld binary via releases
         version_url, weld_url = _get_release_urls()  # re-resolve for correct weld_url
+        # If weld asset ends with .py → rename (strip suffix) and exclude .py
+        release_source_name = os.path.basename(weld_url.split("?")[0].split("#")[0])
+        source_name = release_source_name
+        if release_source_name.endswith(".py"):
+            _print(f"{_DIM}Release asset {release_source_name} ends with .py → will install as {_strip_py_suffix(release_source_name)} (exclude .py){_RESET}")
         _print(f"\n{_BOLD}{_CYAN}Downloading weld binary...{_RESET}")
         _print(f"{_DIM}From: {weld_url}{_RESET}")
 
@@ -3854,6 +3879,26 @@ def cmd_self_upgrade(force: bool = False, yes: bool = False) -> None:
                 pass
 
     _print(f"\n{_GREEN}{_BOLD}✔ Installed:{_RESET} {dest}  {_DIM}({len(data)} bytes, {remote_version}){_RESET}")
+
+    # If source was .py → ensure we installed without .py and exclude stale .py
+    # (e.g. weld.py → weld). This satisfies "if ends with .py then rename and exclude it"
+    if source_name.endswith(".py"):
+        stale = os.path.join(bin_dir, source_name)  # e.g. ~/.local/bin/weld.py
+        # If we somehow left a stale .py file (e.g. previous install left it), remove
+        if os.path.isfile(stale) and os.path.abspath(stale) != os.path.abspath(dest):
+            try:
+                os.remove(stale)
+                _print(f"{_DIM}Excluded stale {stale} (ends with .py → renamed to {os.path.basename(dest)}){_RESET}")
+            except OSError:
+                pass
+        # Also handle dest.py case from older installs
+        alt_stale = dest + ".py"
+        if os.path.isfile(alt_stale) and os.path.abspath(alt_stale) != os.path.abspath(dest):
+            try:
+                os.remove(alt_stale)
+                _print(f"{_DIM}Excluded stale {alt_stale}{_RESET}")
+            except OSError:
+                pass
 
     # Verify new binary
     try:
