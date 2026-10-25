@@ -13,6 +13,7 @@ A fast, lightweight Python application packaging and distribution tool designed 
 * **Project Scaffolding**: Quickly create new project structures with ready-to-use templates (Flask, FastAPI, CLI, Daemon, TUI, Scraper, etc.).
 * **Code Validation**: Runs `ruff` checks and bytecode compilation (`py_compile`) before building.
 * **Compilation Engines**: Compiles executables using **Nuitka** or **PyInstaller**, and shared library modules (`.so`) using **Cython**.
+* **Custom Tool Options**: Add or remove saved Nuitka/Ruff options with `-Wnuitka` / `-Enuitka` / `-Wruff` / `-Eruff` (e.g. `weld -Wruff "--ignore=F401"`).
 * **Package Archives (`.wld`)**: Archives your Python binaries, libraries, configurations, Readmes, and Changelogs into portable `.wld` files.
 * **Dependency Management**: Automatically manages and installs PyPI dependencies via `uv` or `pip` (can be disabled with `auto_pip_install = false`).
 * **Package Lifecycle**: Supports installing, updating, pinning/unpinning, running, searching, duplicating, renaming, and removing packages.
@@ -57,10 +58,34 @@ compiler = "nuitka"        # "nuitka" or "pyinstaller"
 libs_compiler = "cython"   # only "cython" is currently supported
 default_version = "1.0.0"
 auto_pip_install = true    # install a package's deps on `weld --install`
+nuitka_opts = []           # extra options passed to Nuitka (see below)
+ruff_opts = ["--no-cache", "--output-format=concise"]  # `ruff check` options
 ```
 
 Run `weld --doctor` at any time to check which tools are available. Tools that
 are not required for the configured compiler are reported as optional.
+
+#### Custom Nuitka / Ruff options (`-W` / `-E`)
+
+Extra options for Nuitka (used by `--install`/`--update`) and Ruff (used by
+`--build`) are saved in `config.toml` and managed with four flags:
+
+```bash
+weld -Wnuitka "--standalone"     # add a Nuitka option (saved)
+weld -Wnuitka "--jobs=4 --quiet" # several options in one string also work
+weld -Enuitka "--standalone"     # remove it again (warns if not found)
+
+weld -Wruff "--ignore=F401"      # add a Ruff option (saved)
+weld -Eruff "--no-cache"         # even the defaults can be removed
+```
+
+`-W...` adds and `-E...` removes; both are repeatable and also accept the
+`-Wruff=--ignore=F401` spelling. Removing an option that is not saved (or
+adding one twice) prints a warning and changes nothing. The flags can be
+combined with a command and then apply to that run immediately, e.g.
+`weld --build myapp -Wruff "--ignore=F401"`. Options are matched exactly,
+one flag at a time (remove `--output-format=concise`, not just
+`--output-format`). `--doctor` and `--stats` show the current lists.
 
 ## 🏁 Quick start
 
