@@ -1,3 +1,4 @@
+#!/usr/bin/env python3
 import argparse
 import copy
 import fnmatch
@@ -57,6 +58,15 @@ WELD_README    = os.path.join(WELD_DIR, "Readme")
 WELD_HISTORY   = os.path.join(WELD_DIR, "history.log")
 WELD_PLUGINS   = os.path.join(WELD_DIR, "plugins")
 WELD_TEMPLATES = os.path.join(WELD_DIR, "templates")
+
+# Self-upgrade release locations (GitHub Releases)
+WELD_REPO           = "MrNotInk/Weld"
+WELD_RELEASE_TAG    = "Python3"  # fallback tag; latest tag is resolved via API first
+RELEASE_VERSION_URL = f"https://github.com/{WELD_REPO}/releases/download/{WELD_RELEASE_TAG}/version"
+RELEASE_WELD_URL    = f"https://github.com/{WELD_REPO}/releases/download/{WELD_RELEASE_TAG}/weld"
+RELEASE_API_URL     = f"https://api.github.com/repos/{WELD_REPO}/releases/latest"
+LOCAL_BIN_DIR       = os.path.expanduser("~/.local/bin")
+LOCAL_BIN_WELD      = os.path.join(LOCAL_BIN_DIR, "weld")
 
 WLD_EXT = ".wld"
 
@@ -3178,6 +3188,554 @@ _weld
 
 
 # ---------------------------------------------------------------------------
+# Self-upgrade helpers
+# ---------------------------------------------------------------------------
+
+def _parse_version(v: str) -> tuple[int, ...]:
+    """Parse a version string into a comparable tuple of ints."""
+    v = v.strip().lstrip("vV")
+    if not v:
+        return (0,)
+    # split on common separators
+    parts = re.split(r"[.\-+_]", v)
+    nums: list[int] = []
+    for p in parts:
+        p = p.strip()
+        if not p:
+            continue
+        m = re.match(r"^(\d+)", p)
+        if m:
+            try:
+                nums.append(int(m.group(1)))
+            except ValueError:
+                nums.append(0)
+        else:
+            # pre-release tags like alpha/beta/rc without leading digits
+            # treat as 0 but keep structure
+            nums.append(0)
+    return tuple(nums) if nums else (0,)
+
+
+def _is_newer_version(remote: str, local: str) -> bool:
+    """Return True if *remote* is newer than *local*."""
+    try:
+        return _parse_version(remote) > _parse_version(local)
+    except Exception:
+        # fallback: string compare
+        return remote.strip() != local.strip() and remote.strip() > local.strip()
+
+
+def _fetch_url_text(url: str, timeout: int = 15) -> str:
+    """Fetch a URL as text. Tries urllib, then curl/wget fallback."""
+    import urllib.request
+    import urllib.error
+
+    last_exc: Exception | None = None
+    try:
+        req = urllib.request.Request(url, headers={"User-Agent": f"weld/{VERSION}", "Accept": "*/*"})
+        with urllib.request.urlopen(req, timeout=timeout) as resp:
+            data = resp.read()
+            # GitHub may return json for API, text for version file
+            try:
+                return data.decode("utf-8").strip()
+            except UnicodeDecodeError:
+                return data.decode("utf-8", errors="replace").strip()
+    except Exception as exc:
+        last_exc = exc
+
+    # fallback to curl / wget if available (helps in minimal containers where SSL CA may fail)
+    for tool, extra_args in (("curl", ["-fsSL"]), ("wget", ["-qO-"])):
+        exe = shutil.which(tool)
+        if not exe:
+            continue
+        try:
+            result = subprocess.run(
+                [exe, *extra_args, url],
+                capture_output=True, text=True, timeout=timeout, check=False,
+            )
+            if result.returncode == 0 and result.stdout.strip():
+                return result.stdout.strip()
+        except Exception:
+            continue
+
+    raise RuntimeError(f"Failed to fetch {url}: {last_exc}") from last_exc
+
+
+def _fetch_url_bytes(url: str, timeout: int = 30) -> bytes:
+    """Fetch a URL as bytes. Tries urllib, then curl/wget fallback."""
+    import urllib.request
+
+    last_exc: Exception | None = None
+    try:
+        req = urllib.request.Request(url, headers={"User-Agent": f"weld/{VERSION}", "Accept": "*/*"})
+        with urllib.request.urlopen(req, timeout=timeout) as resp:
+            return resp.read()
+    except Exception as exc:
+        last_exc = exc
+
+    # curl fallback (binary safe)
+    curl = shutil.which("curl")
+    if curl:
+        try:
+            with tempfile.NamedTemporaryFile(delete=False) as tmp:
+                tmp_path = tmp.name
+            result = subprocess.run(
+                [curl, "-fsSL", "-o", tmp_path, url],
+                capture_output=True, text=True, timeout=timeout, check=False,
+            )
+            if result.returncode == 0 and os.path.isfile(tmp_path):
+                with open(tmp_path, "rb") as fp:
+                    data = fp.read()
+                os.remove(tmp_path)
+                if data:
+                    return data
+            if os.path.exists(tmp_path):
+                os.remove(tmp_path)
+        except Exception:
+            pass
+
+    wget = shutil.which("wget")
+    if wget:
+        try:
+            with tempfile.NamedTemporaryFile(delete=False) as tmp:
+                tmp_path = tmp.name
+            result = subprocess.run(
+                [wget, "-qO", tmp_path, url],
+                capture_output=True, text=True, timeout=timeout, check=False,
+            )
+            if result.returncode == 0 and os.path.isfile(tmp_path):
+                with open(tmp_path, "rb") as fp:
+                    data = fp.read()
+                os.remove(tmp_path)
+                if data:
+                    return data
+            if os.path.exists(tmp_path):
+                os.remove(tmp_path)
+        except Exception:
+            pass
+
+    raise RuntimeError(f"Failed to fetch {url}: {last_exc}") from last_exc
+
+
+def _get_release_urls() -> tuple[str, str]:
+    """
+    Try to resolve the latest release tag via GitHub API, falling back to
+    the hardcoded RELEASE_VERSION_URL / RELEASE_WELD_URL.
+    Returns (version_url, weld_url).
+
+    Env overrides (for testing):
+      WELD_VERSION_URL, WELD_WELD_URL, WELD_RELEASE_API_URL
+    """
+    env_version = os.environ.get("WELD_VERSION_URL")
+    env_weld = os.environ.get("WELD_WELD_URL")
+    if env_version or env_weld:
+        return env_version or RELEASE_VERSION_URL, env_weld or RELEASE_WELD_URL
+
+    # Allow API URL override for testing
+    api_url = os.environ.get("WELD_RELEASE_API_URL") or RELEASE_API_URL
+    try:
+        api_text = _fetch_url_text(api_url, timeout=10)
+        info = json.loads(api_text)
+        tag = info.get("tag_name")
+        if isinstance(tag, str) and tag.strip():
+            tag = tag.strip()
+            version_url = f"https://github.com/{WELD_REPO}/releases/download/{tag}/version"
+            weld_url = f"https://github.com/{WELD_REPO}/releases/download/{tag}/weld"
+            return version_url, weld_url
+    except Exception:
+        pass
+    return RELEASE_VERSION_URL, RELEASE_WELD_URL
+
+
+def _ensure_shebang(file_path: str) -> None:
+    """Ensure *file_path* starts with #!/usr/bin/env python3."""
+    expected = b"#!/usr/bin/env python3\n"
+    try:
+        with open(file_path, "rb") as fp:
+            content = fp.read()
+    except OSError as exc:
+        console.print(f"[red]Error:[/red] Could not read {_esc(file_path)}: {_esc(str(exc))}")
+        raise SystemExit(1)
+
+    if not content:
+        # empty file, just write shebang
+        try:
+            with open(file_path, "wb") as out:
+                out.write(expected)
+        except OSError as exc:
+            console.print(f"[red]Error:[/red] Could not write shebang: {_esc(str(exc))}")
+            raise SystemExit(1)
+        return
+
+    lines = content.splitlines(keepends=True)
+    first = lines[0] if lines else b""
+
+    if first.startswith(b"#!"):
+        if first.strip() != expected.strip():
+            # replace shebang
+            lines[0] = expected
+            new_content = b"".join(lines)
+            try:
+                _atomic_write(file_path, new_content)
+            except OSError as exc:
+                console.print(f"[red]Error:[/red] Could not update shebang: {_esc(str(exc))}")
+                raise SystemExit(1)
+        return
+    else:
+        # prepend shebang
+        try:
+            _atomic_write(file_path, expected + content)
+        except OSError as exc:
+            console.print(f"[red]Error:[/red] Could not prepend shebang: {_esc(str(exc))}")
+            raise SystemExit(1)
+
+
+def _is_in_path(directory: str) -> bool:
+    """Return True if *directory* is already in $PATH."""
+    path_env = os.environ.get("PATH", "")
+    # normalize both sides
+    needle = os.path.abspath(os.path.expanduser(directory))
+    for entry in path_env.split(os.pathsep):
+        if not entry.strip():
+            continue
+        try:
+            if os.path.abspath(os.path.expanduser(entry.strip())) == needle:
+                return True
+        except Exception:
+            if entry.strip() == directory:
+                return True
+    # also check literal $HOME form
+    home_bin_literal = "$HOME/.local/bin"
+    if directory == os.path.expanduser("~/.local/bin") and home_bin_literal in path_env:
+        return True
+    return False
+
+
+def _add_local_bin_to_path(bin_dir: str) -> None:
+    """
+    Try to add *bin_dir* to the user's shell RC files.
+    Creates ~/.local/bin if needed is handled elsewhere; this only edits RC.
+    """
+    home = os.path.expanduser("~")
+    rc_candidates = [
+        os.path.join(home, ".bashrc"),
+        os.path.join(home, ".zshrc"),
+        os.path.join(home, ".profile"),
+        os.path.join(home, ".bash_profile"),
+    ]
+    # Prefer the literal $HOME form for portability across machines
+    export_line = 'export PATH="$HOME/.local/bin:$PATH"'
+
+    # If any RC already configures .local/bin, don't duplicate — just inform
+    for rc in rc_candidates:
+        if not os.path.isfile(rc):
+            continue
+        try:
+            with open(rc, encoding="utf-8", errors="replace") as fp:
+                if ".local/bin" in fp.read():
+                    _print(f"{_DIM}Found {_RESET}{rc}{_DIM} already configures .local/bin — not adding duplicate.{_RESET}")
+                    _print(f"{_DIM}Restart your shell or run: source {rc}{_RESET}")
+                    return
+        except OSError:
+            continue
+
+    updated: list[str] = []
+    for rc in rc_candidates:
+        if not os.path.isfile(rc):
+            continue
+        try:
+            with open(rc, encoding="utf-8", errors="replace") as fp:
+                content = fp.read()
+        except OSError:
+            continue
+        # already contains .local/bin in some form?
+        if ".local/bin" in content:
+            continue
+        try:
+            with open(rc, "a", encoding="utf-8") as fp:
+                fp.write(f"\n# Added by weld self-upgrade — make `weld` available\n{export_line}\n")
+            updated.append(rc)
+        except OSError:
+            continue
+
+    if not updated:
+        # No existing RC contained it; create/update ~/.profile as fallback
+        profile = os.path.join(home, ".profile")
+        try:
+            content = ""
+            if os.path.isfile(profile):
+                with open(profile, encoding="utf-8", errors="replace") as fp:
+                    content = fp.read()
+            if ".local/bin" not in content:
+                with open(profile, "a", encoding="utf-8") as fp:
+                    if content and not content.endswith("\n"):
+                        fp.write("\n")
+                    if not content:
+                        fp.write(f"{export_line}\n")
+                    else:
+                        fp.write(f"\n# Added by weld self-upgrade — make `weld` available\n{export_line}\n")
+                updated.append(profile)
+        except OSError:
+            pass
+
+    if updated:
+        _print(f"{_GREEN}✔ Added {_RESET}{bin_dir} to PATH in: {', '.join(updated)}")
+        _print(f"{_DIM}Restart your shell or run: source {updated[0]}{_RESET}")
+    else:
+        # Could not auto-edit; at least tell the user what to do
+        _print(f"{_YELLOW}Warning:{_RESET} {bin_dir} is not in your PATH.")
+        _print(f"{_DIM}Add this to your shell RC (~/.bashrc / ~/.zshrc):{_RESET} {export_line}")
+        _print(f"{_DIM}Then restart your shell or run: export PATH=\"$HOME/.local/bin:$PATH\"{_RESET}")
+
+
+def _prompt_upgrade(current: str, remote: str) -> bool:
+    """Prompt user to confirm upgrade; return True if yes."""
+    _print(f"\n{_BOLD}{_CYAN}Update available:{_RESET} {current} → {_GREEN}{remote}{_RESET}")
+    # Non-interactive without TTY: require --yes
+    if not sys.stdin.isatty():
+        _print(f"{_YELLOW}Non-interactive shell detected. Use --yes to auto-confirm.{_RESET}")
+        return False
+    try:
+        answer = input(f"Upgrade now? [Y/n]: ").strip().lower()
+    except (EOFError, KeyboardInterrupt):
+        _print(f"\n{_YELLOW}Aborted.{_RESET}")
+        return False
+    # default yes on empty, yes on y/yes
+    if not answer or answer in ("y", "yes"):
+        return True
+    return False
+
+
+def cmd_check_update() -> None:
+    """Check if a newer weld version is available from releases."""
+    _print(f"{_BOLD}{_CYAN}Checking for updates...{_RESET}  current {_BOLD}{VERSION}{_RESET}")
+    version_url, _ = _get_release_urls()
+    _print(f"{_DIM}Fetching {version_url}{_RESET}")
+    try:
+        with spinner(f"Fetching version from {WELD_REPO}"):
+            remote_version = _fetch_url_text(version_url).strip()
+    except Exception as exc:
+        console.print(f"[red]Error:[/red] Could not fetch remote version: {_esc(str(exc))}")
+        raise SystemExit(1)
+
+    if not remote_version:
+        console.print("[red]Error:[/red] Remote version file is empty")
+        raise SystemExit(1)
+
+    # Sanitize: version file may contain whitespace/newlines, take first token
+    remote_version = remote_version.split()[0].strip()
+    _print(f"{_BOLD}Current:{_RESET} {VERSION}")
+    _print(f"{_BOLD}Latest:{_RESET}  {remote_version}  {_DIM}({version_url}){_RESET}")
+
+    if _is_newer_version(remote_version, VERSION):
+        _print(f"\n{_GREEN}{_BOLD}Update available:{_RESET} {VERSION} → {remote_version}")
+        _print(f"{_DIM}Run: weld --self-upgrade  (or weld --self-upgrade --yes for non-interactive){_RESET}")
+    elif _parse_version(remote_version) == _parse_version(VERSION):
+        _print(f"\n{_GREEN}✔ You are on the latest version.{_RESET}")
+    else:
+        _print(f"\n{_YELLOW}You are ahead of the release ({VERSION} > {remote_version}).{_RESET}")
+
+
+def cmd_self_upgrade(force: bool = False, yes: bool = False) -> None:
+    """
+    Self-upgrade weld by downloading the latest ``weld`` binary from GitHub Releases.
+    Flow:
+      1. Fetch remote version file
+      2. Compare with local VERSION; prompt unless --yes/--force
+      3. Download ``weld`` file, ensure shebang + chmod +x
+      4. Install to ~/.local/bin/weld (create dir if needed)
+      5. Ensure ~/.local/bin is in $PATH (create + edit RC if not)
+    """
+    _print(f"{_BOLD}{_CYAN}weld self-upgrade{_RESET}  current {_BOLD}{VERSION}{_RESET}")
+
+    version_url, weld_url = _get_release_urls()
+    _print(f"{_DIM}Release: {WELD_REPO}  (version file: {version_url}){_RESET}")
+
+    # 1. Fetch remote version
+    try:
+        with spinner(f"Fetching remote version"):
+            remote_version = _fetch_url_text(version_url).strip().split()[0]
+    except Exception as exc:
+        console.print(f"[red]Error:[/red] Could not fetch remote version: {_esc(str(exc))}")
+        _print(f"{_DIM}Tried: {version_url}{_RESET}")
+        _print(f"{_DIM}Check your internet or try: curl -fsSL {version_url}{_RESET}")
+        raise SystemExit(1)
+
+    if not remote_version:
+        console.print("[red]Error:[/red] Remote version file is empty")
+        raise SystemExit(1)
+
+    _print(f"{_BOLD}Current:{_RESET} {VERSION}")
+    _print(f"{_BOLD}Latest:{_RESET}  {remote_version}")
+
+    is_newer = _is_newer_version(remote_version, VERSION)
+    is_same = _parse_version(remote_version) == _parse_version(VERSION)
+
+    if not is_newer and not force:
+        if is_same:
+            _print(f"\n{_GREEN}✔ Already on the latest version ({VERSION}).{_RESET}")
+            _print(f"{_DIM}Use --force to reinstall anyway.{_RESET}")
+            return
+        else:
+            _print(f"\n{_YELLOW}You are ahead of the release ({VERSION} > {remote_version}).{_RESET}")
+            _print(f"{_DIM}Use --force to downgrade/reinstall.{_RESET}")
+            return
+
+    if is_newer:
+        _print(f"\n{_GREEN}{_BOLD}New version available:{_RESET} {VERSION} → {remote_version}")
+    else:
+        _print(f"\n{_YELLOW}Force reinstall:{_RESET} {VERSION} → {remote_version}")
+
+    # 2. Prompt unless auto-confirm
+    if not yes and not force:
+        # --force without --yes still prompts? No, --force should skip prompt as explicit intent
+        # Keep behavior: force implies yes for automation, but we ask if not --yes
+        # Spec says \"if version is exceeded then it will ask if you to upgrade if yes then download\"
+        # So we need to ask. Only skip if --yes is passed.
+        if not _prompt_upgrade(VERSION, remote_version):
+            _print(f"{_YELLOW}Upgrade cancelled.{_RESET}")
+            return
+    elif not yes and force:
+        # --force is explicit, don't prompt
+        pass
+    else:
+        # yes=True, auto-confirm
+        _print(f"{_DIM}Auto-confirm (--yes) — proceeding.{_RESET}")
+
+    # 3. Download weld binary
+    _print(f"\n{_BOLD}{_CYAN}Downloading weld binary...{_RESET}")
+    _print(f"{_DIM}From: {weld_url}{_RESET}")
+
+    try:
+        with spinner(f"Downloading weld {remote_version}"):
+            data = _fetch_url_bytes(weld_url)
+    except Exception as exc:
+        console.print(f"[red]Error:[/red] Could not download weld binary: {_esc(str(exc))}")
+        _print(f"{_DIM}Tried: {weld_url}{_RESET}")
+        raise SystemExit(1)
+
+    if not data or len(data) < 1024:
+        console.print(f"[red]Error:[/red] Downloaded weld binary is too small ({len(data) if data else 0} bytes) — corrupted download")
+        raise SystemExit(1)
+
+    # Basic sanity: should look like a Python script (contains weld marker or VERSION)
+    if b"weld" not in data.lower() and b"VERSION" not in data and b"import argparse" not in data:
+        console.print("[yellow]Warning:[/yellow] Downloaded file does not look like weld (missing expected markers) — continuing anyway")
+
+    # 4. Install to ~/.local/bin/weld
+    bin_dir = os.path.expanduser(LOCAL_BIN_DIR)
+    dest = os.path.expanduser(LOCAL_BIN_WELD)
+
+    try:
+        os.makedirs(bin_dir, exist_ok=True)
+    except OSError as exc:
+        console.print(f"[red]Error:[/red] Could not create {bin_dir}: {_esc(str(exc))}")
+        raise SystemExit(1)
+
+    # Backup existing if present
+    if os.path.isfile(dest):
+        ts = datetime.now().strftime("%Y%m%d_%H%M%S")
+        backup = f"{dest}.bak.{ts}"
+        try:
+            shutil.copy2(dest, backup)
+            _print(f"{_DIM}Backed up existing weld → {backup}{_RESET}")
+        except OSError as exc:
+            _print(f"{_YELLOW}Warning:{_RESET} Could not backup existing {dest}: {exc}")
+
+    # Atomic write to dest via temp file in same directory
+    tmp_fd = None
+    tmp_path = None
+    try:
+        fd, tmp_path = tempfile.mkstemp(prefix=".weld-upgrade-", dir=bin_dir)
+        tmp_fd = fd
+        with os.fdopen(fd, "wb") as fp:
+            fp.write(data)
+            fp.flush()
+            try:
+                os.fsync(fp.fileno())
+            except OSError:
+                pass
+        tmp_fd = None  # fd closed
+
+        # Ensure shebang
+        _ensure_shebang(tmp_path)
+
+        # chmod +x
+        try:
+            os.chmod(tmp_path, 0o755)
+        except OSError as exc:
+            _print(f"{_YELLOW}Warning:{_RESET} Could not chmod +x: {exc}")
+
+        # Replace dest atomically
+        os.replace(tmp_path, dest)
+        tmp_path = None
+
+        # Ensure final chmod (in case replace lost it on some filesystems)
+        try:
+            os.chmod(dest, 0o755)
+        except OSError:
+            pass
+
+    except OSError as exc:
+        console.print(f"[red]Error:[/red] Could not install to {dest}: {_esc(str(exc))}")
+        if tmp_path and os.path.exists(tmp_path):
+            try:
+                os.remove(tmp_path)
+            except OSError:
+                pass
+        raise SystemExit(1)
+    finally:
+        if tmp_fd is not None:
+            try:
+                os.close(tmp_fd)
+            except OSError:
+                pass
+        if tmp_path and os.path.exists(tmp_path):
+            try:
+                os.remove(tmp_path)
+            except OSError:
+                pass
+
+    _print(f"\n{_GREEN}{_BOLD}✔ Installed:{_RESET} {dest}  {_DIM}({len(data)} bytes, {remote_version}){_RESET}")
+
+    # Verify new binary
+    try:
+        result = subprocess.run(
+            [dest, "--version"],
+            capture_output=True, text=True, timeout=10, check=False,
+        )
+        out = (result.stdout or "") + (result.stderr or "")
+        if remote_version in out or VERSION in out or "weld" in out.lower():
+            _print(f"{_DIM}Verified: {out.strip().splitlines()[0][:120]}{_RESET}")
+        else:
+            _print(f"{_DIM}Installed binary output: {out.strip()[:120]}{_RESET}")
+    except Exception:
+        pass
+
+    # 5. Ensure ~/.local/bin is in PATH
+    if not _is_in_path(bin_dir):
+        _print(f"\n{_YELLOW}Note:{_RESET} {bin_dir} is not in your PATH.")
+        try:
+            _add_local_bin_to_path(bin_dir)
+        except Exception as exc:
+            _print(f"{_YELLOW}Warning:{_RESET} Could not update PATH automatically: {exc}")
+            _print(f"{_DIM}Manually add: export PATH=\"$HOME/.local/bin:$PATH\"{_RESET}")
+    else:
+        _print(f"{_DIM}{bin_dir} is already in PATH.{_RESET}")
+
+    # History
+    try:
+        _log("SELF-UPGRADE", "weld", f"{VERSION} -> {remote_version}")
+    except Exception:
+        pass
+
+    _print(f"\n{_GREEN}{_BOLD}Upgrade complete!{_RESET}  {VERSION} → {remote_version}")
+    _print(f"{_DIM}Run: {dest} --version  to confirm. If 'weld' command not found, restart your shell.{_RESET}")
+    # Also mention direct python fallback
+    _print(f"{_DIM}Fallback: python {dest} --version{_RESET}")
+
+
+# ---------------------------------------------------------------------------
 # Entry point
 # ---------------------------------------------------------------------------
 
@@ -3220,6 +3778,10 @@ def main() -> None:
     parser.add_argument("--template",     metavar="<name>")
     parser.add_argument("--templates",    action="store_true")
     parser.add_argument("--completions",  metavar="<shell>")
+    parser.add_argument("--self-upgrade", action="store_true", help="Upgrade weld itself to the latest release from GitHub")
+    parser.add_argument("--check-update", action="store_true", help="Check if a newer weld version is available")
+    parser.add_argument("--yes",          action="store_true", help="Auto-confirm prompts (for --self-upgrade)")
+    parser.add_argument("--force",        action="store_true", help="Force reinstall even if already on latest (for --self-upgrade)")
 
     args = parser.parse_args()
 
@@ -3294,6 +3856,10 @@ def main() -> None:
                     "(supported: zsh)"
                 )
                 raise SystemExit(1)
+        elif args.self_upgrade:
+            cmd_self_upgrade(force=args.force, yes=args.yes)
+        elif args.check_update:
+            cmd_check_update()
         else:
             parser.print_help()
 
