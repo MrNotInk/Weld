@@ -46,7 +46,7 @@ except ImportError:
 
 console = Console()
 
-VERSION = "0.1.0"
+VERSION = "0.2.0"
 
 WELD_DIR       = os.path.expanduser("~/.weld")
 WELD_BIN       = os.path.join(WELD_DIR, "bin")
