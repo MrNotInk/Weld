@@ -46,7 +46,7 @@ except ImportError:
 
 console = Console()
 
-VERSION = "0.1.0"
+VERSION = "0.2.0"
 
 WELD_DIR       = os.path.expanduser("~/.weld")
 WELD_BIN       = os.path.join(WELD_DIR, "bin")
@@ -63,6 +63,11 @@ WELD_TEMPLATES = os.path.join(WELD_DIR, "templates")
 WELD_REPO           = "MrNotInk/Weld"
 WELD_GIT_URL        = f"https://github.com/{WELD_REPO}.git"
 WELD_RELEASE_TAG    = "Python3"  # fallback tag; latest tag is resolved via API first
+# version file now lives in repo (main branch) — not only in releases
+REPO_RAW_VERSION_URL = f"https://raw.githubusercontent.com/{WELD_REPO}/main/version"
+REPO_RAW_WELD_URL    = f"https://raw.githubusercontent.com/{WELD_REPO}/main/weld.py"
+REPO_API_VERSION_URL = f"https://api.github.com/repos/{WELD_REPO}/contents/version"
+REPO_API_WELD_URL    = f"https://api.github.com/repos/{WELD_REPO}/contents/weld.py"
 RELEASE_VERSION_URL = f"https://github.com/{WELD_REPO}/releases/download/{WELD_RELEASE_TAG}/version"
 RELEASE_WELD_URL    = f"https://github.com/{WELD_REPO}/releases/download/{WELD_RELEASE_TAG}/weld"
 RELEASE_API_URL     = f"https://api.github.com/repos/{WELD_REPO}/releases/latest"
@@ -3348,6 +3353,91 @@ def _get_release_urls() -> tuple[str, str]:
     return RELEASE_VERSION_URL, RELEASE_WELD_URL
 
 
+def _fetch_version_from_repo() -> str:
+    """
+    Fetch version string from repo's ``version`` file (raw or API).
+    Repo location: https://raw.githubusercontent.com/MrNotInk/Weld/main/version
+    Tries raw URL, then GitHub API, then raises.
+    Env override: WELD_VERSION_URL (direct file URL) takes precedence.
+    """
+    env_url = os.environ.get("WELD_VERSION_URL")
+    if env_url:
+        # Let caller handle file:// testing URLs
+        return _fetch_url_text(env_url).strip().split()[0]
+
+    # 1. Try raw.githubusercontent.com
+    try:
+        txt = _fetch_url_text(REPO_RAW_VERSION_URL, timeout=10)
+        if txt.strip():
+            return txt.strip().split()[0]
+    except Exception:
+        pass
+
+    # 2. Try GitHub API (works in sandboxed env where raw SSL fails)
+    try:
+        api_txt = _fetch_url_text(REPO_API_VERSION_URL, timeout=10)
+        info = json.loads(api_txt)
+        # API returns base64 content
+        b64 = info.get("content", "")
+        if b64:
+            import base64
+            decoded = base64.b64decode(b64).decode("utf-8", errors="replace")
+            if decoded.strip():
+                return decoded.strip().split()[0]
+        # Fallback to download_url field if content missing
+        dl = info.get("download_url")
+        if dl:
+            return _fetch_url_text(dl).strip().split()[0]
+    except Exception:
+        pass
+
+    raise RuntimeError("Could not fetch version from repo")
+
+
+def _fetch_weld_from_repo() -> bytes:
+    """
+    Fetch weld.py bytes from repo (raw or API).
+    Tries raw URL then GitHub API download_url.
+    Env override: WELD_WELD_URL / WELD_GIT_URL is handled elsewhere; this is raw fallback.
+    """
+    env_url = os.environ.get("WELD_WELD_URL")
+    if env_url and env_url.endswith(".py"):
+        # If env weld URL is explicitly a .py file, use it
+        return _fetch_url_bytes(env_url)
+
+    # 1. Raw URL
+    try:
+        data = _fetch_url_bytes(REPO_RAW_WELD_URL, timeout=15)
+        if data and len(data) > 1024:
+            return data
+    except Exception:
+        pass
+
+    # 2. GitHub API
+    try:
+        api_txt = _fetch_url_text(REPO_API_WELD_URL, timeout=10)
+        info = json.loads(api_txt)
+        dl = info.get("download_url")
+        if dl:
+            data = _fetch_url_bytes(dl, timeout=15)
+            if data:
+                return data
+        # If download_url not available, try base64 content (may be truncated for large files)
+        b64 = info.get("content", "")
+        if b64:
+            import base64
+            # API truncates >1MB with encoding, but weld.py is ~115k, should be okay
+            # However GitHub may return partial with truncated:true
+            if not info.get("truncated"):
+                decoded = base64.b64decode(b64)
+                if decoded:
+                    return decoded
+    except Exception:
+        pass
+
+    raise RuntimeError("Could not fetch weld.py from repo")
+
+
 def _strip_py_suffix(name: str) -> str:
     """If *name* ends with .py, strip it (weld.py → weld)."""
     return name[:-3] if name.endswith(".py") else name
@@ -3404,11 +3494,30 @@ def _clone_repo_and_get_weld(version_only: bool = False) -> tuple[str, bytes | N
             data = fp.read()
         source_name = os.path.basename(weld_py)
 
-        # Extract VERSION = "x.y.z"
-        m = re.search(br'VERSION\s*=\s*["\']([^"\']+)["\']', data)
-        if not m:
-            raise RuntimeError("Could not find VERSION in cloned weld.py")
-        version = m.group(1).decode("utf-8", errors="replace").strip()
+        # Version may live in repo's `version` file (new) — prefer it over weld.py's VERSION
+        # This supports the change where version file moved into repo root
+        version_path = os.path.join(clone_dir, "version")
+        if os.path.isfile(version_path):
+            try:
+                with open(version_path, encoding="utf-8", errors="replace") as vf:
+                    vtxt = vf.read().strip().split()
+                    if vtxt and vtxt[0]:
+                        version = vtxt[0].strip()
+                    else:
+                        raise ValueError("empty version file")
+                # Keep data from weld.py, but version from version file
+            except Exception:
+                # Fallback to weld.py VERSION if version file read fails
+                m = re.search(br'VERSION\s*=\s*["\']([^"\']+)["\']', data)
+                if not m:
+                    raise RuntimeError("Could not find VERSION in cloned weld.py")
+                version = m.group(1).decode("utf-8", errors="replace").strip()
+        else:
+            # Extract VERSION = "x.y.z" from weld.py
+            m = re.search(br'VERSION\s*=\s*["\']([^"\']+)["\']', data)
+            if not m:
+                raise RuntimeError("Could not find VERSION in cloned weld.py")
+            version = m.group(1).decode("utf-8", errors="replace").strip()
 
         if version_only:
             return version, None, source_name
@@ -3641,15 +3750,23 @@ def cmd_check_update() -> None:
             _print(f"{_DIM}Git check failed ({exc}), falling back to releases...{_RESET}")
 
     if remote_version is None:
-        version_url, _ = _get_release_urls()
-        _print(f"{_DIM}Fetching {version_url}{_RESET}")
+        # Try repo raw version file (now lives in repo, not releases) — before fallback to releases
         try:
-            with spinner(f"Fetching version from {WELD_REPO}"):
-                remote_version = _fetch_url_text(version_url).strip()
+            with spinner(f"Fetching version from repo {WELD_REPO}"):
+                remote_version = _fetch_version_from_repo().strip()
+            source = REPO_RAW_VERSION_URL
+            _print(f"{_DIM}Got version via repo raw: {remote_version}{_RESET}")
         except Exception as exc:
-            console.print(f"[red]Error:[/red] Could not fetch remote version: {_esc(str(exc))}")
-            raise SystemExit(1)
-        source = version_url
+            _print(f"{_DIM}Repo version fetch failed ({exc}), trying releases...{_RESET}")
+            version_url, _ = _get_release_urls()
+            _print(f"{_DIM}Fetching {version_url}{_RESET}")
+            try:
+                with spinner(f"Fetching version from {WELD_REPO}"):
+                    remote_version = _fetch_url_text(version_url).strip()
+            except Exception as exc2:
+                console.print(f"[red]Error:[/red] Could not fetch remote version: {_esc(str(exc2))}")
+                raise SystemExit(1)
+            source = version_url
 
     if not remote_version:
         console.print("[red]Error:[/red] Remote version file is empty")
@@ -3715,18 +3832,35 @@ def cmd_self_upgrade(force: bool = False, yes: bool = False) -> None:
         source_name = ""
 
     if not use_git:
-        version_url, weld_url = _get_release_urls()
-        _print(f"{_DIM}Release: {WELD_REPO}  (version file: {version_url}){_RESET}")
-
-        # 1. Fetch remote version
+        # Prefer repo version file (now lives in repo) — fallback to releases
         try:
-            with spinner(f"Fetching remote version"):
-                remote_version = _fetch_url_text(version_url).strip().split()[0]
+            with spinner("Fetching remote version (repo)"):
+                remote_version = _fetch_version_from_repo().strip().split()[0]
+            version_url = REPO_RAW_VERSION_URL
+            source_desc = f"repo:{REPO_RAW_VERSION_URL}"
+            _print(f"{_DIM}Repo version: {remote_version} via {REPO_RAW_VERSION_URL}{_RESET}")
         except Exception as exc:
-            console.print(f"[red]Error:[/red] Could not fetch remote version: {_esc(str(exc))}")
-            _print(f"{_DIM}Tried: {version_url}{_RESET}")
-            _print(f"{_DIM}Check your internet or try: curl -fsSL {version_url}{_RESET}")
-            raise SystemExit(1)
+            _print(f"{_DIM}Repo version fetch failed ({exc}), trying releases...{_RESET}")
+            version_url, weld_url = _get_release_urls()
+            _print(f"{_DIM}Release: {WELD_REPO}  (version file: {version_url}){_RESET}")
+            try:
+                with spinner(f"Fetching remote version"):
+                    remote_version = _fetch_url_text(version_url).strip().split()[0]
+            except Exception as exc2:
+                console.print(f"[red]Error:[/red] Could not fetch remote version: {_esc(str(exc2))}")
+                _print(f"{_DIM}Tried: {version_url}{_RESET}")
+                _print(f"{_DIM}Check your internet or try: curl -fsSL {version_url}{_RESET}")
+                raise SystemExit(1)
+            if not remote_version:
+                console.print("[red]Error:[/red] Remote version file is empty")
+                raise SystemExit(1)
+            else:
+                # Keep weld_url for later download fallback
+                pass
+        else:
+            # Repo succeeded — keep weld_url undefined for now, will fetch weld via repo raw later
+            weld_url = ""  # placeholder, will be determined in download step
+            version_url = REPO_RAW_VERSION_URL
 
         if not remote_version:
             console.print("[red]Error:[/red] Remote version file is empty")
@@ -3772,29 +3906,40 @@ def cmd_self_upgrade(force: bool = False, yes: bool = False) -> None:
         # yes=True, auto-confirm
         _print(f"{_DIM}Auto-confirm (--yes) — proceeding.{_RESET}")
 
-    # 3. Get weld bytes (already have if git, else download)
+    # 3. Get weld bytes (already have if git, else download from repo raw → releases)
     if use_git:
         # data already from clone
         assert data is not None
         _print(f"\n{_BOLD}{_CYAN}Got weld via git clone...{_RESET}  {_DIM}({len(data)} bytes from {source_desc}){_RESET}")
     else:
-        # Download weld binary via releases
-        version_url, weld_url = _get_release_urls()  # re-resolve for correct weld_url
-        # If weld asset ends with .py → rename (strip suffix) and exclude .py
-        release_source_name = os.path.basename(weld_url.split("?")[0].split("#")[0])
-        source_name = release_source_name
-        if release_source_name.endswith(".py"):
-            _print(f"{_DIM}Release asset {release_source_name} ends with .py → will install as {_strip_py_suffix(release_source_name)} (exclude .py){_RESET}")
-        _print(f"\n{_BOLD}{_CYAN}Downloading weld binary...{_RESET}")
-        _print(f"{_DIM}From: {weld_url}{_RESET}")
-
+        # Try repo raw weld.py first (version file now lives in repo), fallback to releases
+        weld_bytes_source = ""
         try:
-            with spinner(f"Downloading weld {remote_version}"):
-                data = _fetch_url_bytes(weld_url)
-        except Exception as exc:
-            console.print(f"[red]Error:[/red] Could not download weld binary: {_esc(str(exc))}")
-            _print(f"{_DIM}Tried: {weld_url}{_RESET}")
-            raise SystemExit(1)
+            with spinner(f"Fetching weld from repo {REPO_RAW_WELD_URL}"):
+                data = _fetch_weld_from_repo()
+            weld_bytes_source = REPO_RAW_WELD_URL
+            release_source_name = os.path.basename(REPO_RAW_WELD_URL.split("?")[0])
+            source_name = release_source_name
+            if release_source_name.endswith(".py"):
+                _print(f"{_DIM}Repo asset {release_source_name} ends with .py → will install as {_strip_py_suffix(release_source_name)} (exclude .py){_RESET}")
+            _print(f"{_DIM}Fetched weld from repo raw ({len(data)} bytes){_RESET}")
+        except Exception as exc_repo:
+            _print(f"{_DIM}Repo weld fetch failed ({exc_repo}), trying releases...{_RESET}")
+            version_url, weld_url = _get_release_urls()
+            release_source_name = os.path.basename(weld_url.split("?")[0].split("#")[0])
+            source_name = release_source_name
+            if release_source_name.endswith(".py"):
+                _print(f"{_DIM}Release asset {release_source_name} ends with .py → will install as {_strip_py_suffix(release_source_name)} (exclude .py){_RESET}")
+            _print(f"\n{_BOLD}{_CYAN}Downloading weld binary...{_RESET}")
+            _print(f"{_DIM}From: {weld_url}{_RESET}")
+            try:
+                with spinner(f"Downloading weld {remote_version}"):
+                    data = _fetch_url_bytes(weld_url)
+                weld_bytes_source = weld_url
+            except Exception as exc:
+                console.print(f"[red]Error:[/red] Could not download weld binary: {_esc(str(exc))}")
+                _print(f"{_DIM}Tried: {weld_url}{_RESET}")
+                raise SystemExit(1)
 
     if not data or len(data) < 1024:
         console.print(f"[red]Error:[/red] Weld file is too small ({len(data) if data else 0} bytes) — corrupted download/clone")
