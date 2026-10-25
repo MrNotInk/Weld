@@ -46,7 +46,7 @@ except ImportError:
 
 console = Console()
 
-VERSION = "0.2.0"
+VERSION = "0.3.0"
 
 WELD_DIR       = os.path.expanduser("~/.weld")
 WELD_BIN       = os.path.join(WELD_DIR, "bin")
@@ -3730,43 +3730,27 @@ def _prompt_upgrade(current: str, remote: str) -> bool:
 
 
 def cmd_check_update() -> None:
-    """Check if a newer weld version is available (via git clone or releases)."""
+    """Check if a newer weld version is available (via git clone)."""
     _print(f"{_BOLD}{_CYAN}Checking for updates...{_RESET}  current {_BOLD}{VERSION}{_RESET}")
 
-    method_pref = os.environ.get("WELD_UPGRADE_METHOD", "").lower()
-    prefer_git = method_pref != "release" and shutil.which("git") is not None
+    if not shutil.which("git"):
+        console.print("[red]Error:[/red] git is required for self-upgrade (releases are gone).")
+        _print(f"{_DIM}Please install git: https://git-scm.com/downloads{_RESET}")
+        _print(f"{_DIM}  Debian/Ubuntu: sudo apt update && sudo apt install git{_RESET}")
+        _print(f"{_DIM}  Fedora: sudo dnf install git  |  macOS: brew install git{_RESET}")
+        raise SystemExit(1)
 
-    remote_version: str | None = None
-    source = ""
-    if prefer_git:
-        git_url = os.environ.get("WELD_GIT_URL") or WELD_GIT_URL
-        _print(f"{_DIM}Trying git clone from {git_url} ...{_RESET}")
-        try:
-            with spinner(f"Cloning {WELD_REPO}"):
-                remote_version, _, _ = _clone_repo_and_get_weld(version_only=True)
-            source = f"git:{git_url}"
-            _print(f"{_DIM}Got version via git clone: {remote_version}{_RESET}")
-        except Exception as exc:
-            _print(f"{_DIM}Git check failed ({exc}), falling back to releases...{_RESET}")
-
-    if remote_version is None:
-        # Try repo raw version file (now lives in repo, not releases) — before fallback to releases
-        try:
-            with spinner(f"Fetching version from repo {WELD_REPO}"):
-                remote_version = _fetch_version_from_repo().strip()
-            source = REPO_RAW_VERSION_URL
-            _print(f"{_DIM}Got version via repo raw: {remote_version}{_RESET}")
-        except Exception as exc:
-            _print(f"{_DIM}Repo version fetch failed ({exc}), trying releases...{_RESET}")
-            version_url, _ = _get_release_urls()
-            _print(f"{_DIM}Fetching {version_url}{_RESET}")
-            try:
-                with spinner(f"Fetching version from {WELD_REPO}"):
-                    remote_version = _fetch_url_text(version_url).strip()
-            except Exception as exc2:
-                console.print(f"[red]Error:[/red] Could not fetch remote version: {_esc(str(exc2))}")
-                raise SystemExit(1)
-            source = version_url
+    git_url = os.environ.get("WELD_GIT_URL") or WELD_GIT_URL
+    _print(f"{_DIM}Cloning {git_url} ...{_RESET}")
+    try:
+        with spinner(f"Cloning {WELD_REPO}"):
+            remote_version, _, _ = _clone_repo_and_get_weld(version_only=True)
+        source = f"git:{git_url}"
+        _print(f"{_DIM}Got version via git clone: {remote_version}{_RESET}")
+    except Exception as exc:
+        console.print(f"[red]Error:[/red] git clone failed: {_esc(str(exc))}")
+        _print(f"{_DIM}Check your internet and that git can access {git_url}{_RESET}")
+        raise SystemExit(1)
 
     if not remote_version:
         console.print("[red]Error:[/red] Remote version file is empty")
@@ -3803,68 +3787,27 @@ def cmd_self_upgrade(force: bool = False, yes: bool = False) -> None:
     """
     _print(f"{_BOLD}{_CYAN}weld self-upgrade{_RESET}  current {_BOLD}{VERSION}{_RESET}")
 
-    method_pref = os.environ.get("WELD_UPGRADE_METHOD", "").lower()
-    prefer_git = method_pref != "release" and shutil.which("git") is not None
-    use_git = prefer_git
+    if not shutil.which("git"):
+        console.print("[red]Error:[/red] git is required for self-upgrade — releases are gone.")
+        _print(f"{_DIM}Please install git: https://git-scm.com/downloads{_RESET}")
+        _print(f"{_DIM}  Debian/Ubuntu: sudo apt update && sudo apt install git{_RESET}")
+        _print(f"{_DIM}  Fedora: sudo dnf install git  |  macOS: brew install git{_RESET}")
+        _print(f"{_DIM}  Then re-run: weld --self-upgrade{_RESET}")
+        raise SystemExit(1)
+
     git_url = os.environ.get("WELD_GIT_URL") or WELD_GIT_URL
-
-    remote_version: str | None = None
-    data: bytes | None = None
-    source_desc = ""
-    git_temp_to_clean: str | None = None
-
-    if use_git:
-        _print(f"{_DIM}Method: git clone {git_url}{_RESET}")
-        try:
-            with spinner(f"Cloning {WELD_REPO}"):
-                remote_version, data, source_name = _clone_repo_and_get_weld(version_only=False)
-            # If source ends with .py → strip and remember to exclude .py artifact
-            if source_name.endswith(".py"):
-                _print(f"{_DIM}Source {source_name} ends with .py → will install as {_strip_py_suffix(source_name)} (exclude .py){_RESET}")
-            source_desc = f"git clone {git_url} ({source_name} → {_strip_py_suffix(source_name)})"
-            _print(f"{_DIM}Cloned version {remote_version} ({len(data) if data else 0} bytes){_RESET}")
-        except Exception as exc:
-            _print(f"{_YELLOW}Git clone failed:{_RESET} {exc}")
-            _print(f"{_DIM}Falling back to releases...{_RESET}")
-            use_git = False
-            source_name = ""  # for later logic
-    else:
-        source_name = ""
-
-    if not use_git:
-        # Prefer repo version file (now lives in repo) — fallback to releases
-        try:
-            with spinner("Fetching remote version (repo)"):
-                remote_version = _fetch_version_from_repo().strip().split()[0]
-            version_url = REPO_RAW_VERSION_URL
-            source_desc = f"repo:{REPO_RAW_VERSION_URL}"
-            _print(f"{_DIM}Repo version: {remote_version} via {REPO_RAW_VERSION_URL}{_RESET}")
-        except Exception as exc:
-            _print(f"{_DIM}Repo version fetch failed ({exc}), trying releases...{_RESET}")
-            version_url, weld_url = _get_release_urls()
-            _print(f"{_DIM}Release: {WELD_REPO}  (version file: {version_url}){_RESET}")
-            try:
-                with spinner(f"Fetching remote version"):
-                    remote_version = _fetch_url_text(version_url).strip().split()[0]
-            except Exception as exc2:
-                console.print(f"[red]Error:[/red] Could not fetch remote version: {_esc(str(exc2))}")
-                _print(f"{_DIM}Tried: {version_url}{_RESET}")
-                _print(f"{_DIM}Check your internet or try: curl -fsSL {version_url}{_RESET}")
-                raise SystemExit(1)
-            if not remote_version:
-                console.print("[red]Error:[/red] Remote version file is empty")
-                raise SystemExit(1)
-            else:
-                # Keep weld_url for later download fallback
-                pass
-        else:
-            # Repo succeeded — keep weld_url undefined for now, will fetch weld via repo raw later
-            weld_url = ""  # placeholder, will be determined in download step
-            version_url = REPO_RAW_VERSION_URL
-
-        if not remote_version:
-            console.print("[red]Error:[/red] Remote version file is empty")
-            raise SystemExit(1)
+    _print(f"{_DIM}Method: git clone {git_url}{_RESET}")
+    try:
+        with spinner(f"Cloning {WELD_REPO}"):
+            remote_version, data, source_name = _clone_repo_and_get_weld(version_only=False)
+        if source_name.endswith(".py"):
+            _print(f"{_DIM}Source {source_name} ends with .py → will install as {_strip_py_suffix(source_name)} (exclude .py){_RESET}")
+        source_desc = f"git clone {git_url} ({source_name} → {_strip_py_suffix(source_name)})"
+        _print(f"{_DIM}Cloned version {remote_version} ({len(data) if data else 0} bytes){_RESET}")
+    except Exception as exc:
+        console.print(f"[red]Error:[/red] git clone failed: {_esc(str(exc))}")
+        _print(f"{_DIM}Check your internet and that git can access {git_url}{_RESET}")
+        raise SystemExit(1)
 
     # Common version handling
     assert remote_version is not None
@@ -3906,40 +3849,9 @@ def cmd_self_upgrade(force: bool = False, yes: bool = False) -> None:
         # yes=True, auto-confirm
         _print(f"{_DIM}Auto-confirm (--yes) — proceeding.{_RESET}")
 
-    # 3. Get weld bytes (already have if git, else download from repo raw → releases)
-    if use_git:
-        # data already from clone
-        assert data is not None
-        _print(f"\n{_BOLD}{_CYAN}Got weld via git clone...{_RESET}  {_DIM}({len(data)} bytes from {source_desc}){_RESET}")
-    else:
-        # Try repo raw weld.py first (version file now lives in repo), fallback to releases
-        weld_bytes_source = ""
-        try:
-            with spinner(f"Fetching weld from repo {REPO_RAW_WELD_URL}"):
-                data = _fetch_weld_from_repo()
-            weld_bytes_source = REPO_RAW_WELD_URL
-            release_source_name = os.path.basename(REPO_RAW_WELD_URL.split("?")[0])
-            source_name = release_source_name
-            if release_source_name.endswith(".py"):
-                _print(f"{_DIM}Repo asset {release_source_name} ends with .py → will install as {_strip_py_suffix(release_source_name)} (exclude .py){_RESET}")
-            _print(f"{_DIM}Fetched weld from repo raw ({len(data)} bytes){_RESET}")
-        except Exception as exc_repo:
-            _print(f"{_DIM}Repo weld fetch failed ({exc_repo}), trying releases...{_RESET}")
-            version_url, weld_url = _get_release_urls()
-            release_source_name = os.path.basename(weld_url.split("?")[0].split("#")[0])
-            source_name = release_source_name
-            if release_source_name.endswith(".py"):
-                _print(f"{_DIM}Release asset {release_source_name} ends with .py → will install as {_strip_py_suffix(release_source_name)} (exclude .py){_RESET}")
-            _print(f"\n{_BOLD}{_CYAN}Downloading weld binary...{_RESET}")
-            _print(f"{_DIM}From: {weld_url}{_RESET}")
-            try:
-                with spinner(f"Downloading weld {remote_version}"):
-                    data = _fetch_url_bytes(weld_url)
-                weld_bytes_source = weld_url
-            except Exception as exc:
-                console.print(f"[red]Error:[/red] Could not download weld binary: {_esc(str(exc))}")
-                _print(f"{_DIM}Tried: {weld_url}{_RESET}")
-                raise SystemExit(1)
+    # 3. Weld bytes already from git clone — no release fallback (releases are gone)
+    assert data is not None
+    _print(f"\n{_BOLD}{_CYAN}Got weld via git clone...{_RESET}  {_DIM}({len(data)} bytes from {source_desc}){_RESET}")
 
     if not data or len(data) < 1024:
         console.print(f"[red]Error:[/red] Weld file is too small ({len(data) if data else 0} bytes) — corrupted download/clone")
