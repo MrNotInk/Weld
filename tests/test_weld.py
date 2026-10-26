@@ -1000,3 +1000,153 @@ def test_wnuitka_options_reach_compiler_and_enuitka_removes_them(
     calls = recorded_calls()
     assert calls and "--jobs=4" not in calls[-1]
     assert "--weld-test-opt=abc" in calls[-1]
+
+
+# ---------------------------------------------------------------------------
+# Weld_tools registry (--install <name> / --update <name> / --update-all)
+# ---------------------------------------------------------------------------
+
+def _registry_wld(root: Path, filename: str, name: str, version: str) -> Path:
+    return make_archive(
+        root / filename,
+        {"name": name, "version": version, "deps": [], "desc": f"{name} pkg"},
+        {"bin/main.py": "print('hi')\n", "Readme": f"{name} readme\n"},
+    )
+
+
+def _write_list(repo: Path, entries: dict) -> None:
+    (repo / "list.json").write_text(json.dumps(entries), encoding="utf-8")
+    subprocess.run(
+        ["git", "-C", str(repo), "-c", "user.email=t@t", "-c", "user.name=t",
+         "add", "list.json"],
+        check=True, capture_output=True,
+    )
+    subprocess.run(
+        ["git", "-C", str(repo), "-c", "user.email=t@t", "-c", "user.name=t",
+         "commit", "-qm", "update list.json"],
+        check=True, capture_output=True,
+    )
+
+
+def _make_tools_repo(root: Path, entries: dict) -> Path:
+    """Create a fake Weld_tools git repo containing list.json."""
+    repo = root / "tools-repo"
+    repo.mkdir(exist_ok=True)
+    subprocess.run(["git", "init", "-q", str(repo)], check=True, capture_output=True)
+    _write_list(repo, entries)
+    return repo
+
+
+def test_install_dot_slash_finds_wld_in_cwd(weld: WeldRunner) -> None:
+    clock = _registry_wld(weld.root, "clock.wld", "clock", "1.1.1")
+    result = weld.ok("--install", "./clock")
+    assert "Installed" in result.stdout
+    assert weld.packages()["clock"]["version"] == "1.1.1"
+    assert (weld.home / ".weld" / "Readme" / "clock-Readme").is_file()
+
+
+def test_install_registry_package(weld: WeldRunner) -> None:
+    wld = _registry_wld(weld.root, "clock.wld", "clock", "1.1.1")
+    repo = _make_tools_repo(
+        weld.root, {"clock": {"version": "1.1.1", "link": wld.resolve().as_uri()}}
+    )
+    result = weld.ok(
+        "--install", "clock", extra_env={"WELD_TOOLS_GIT_URL": str(repo)}
+    )
+    assert "Installed" in result.stdout
+    assert "Downloaded" in result.stdout
+    assert weld.packages()["clock"]["version"] == "1.1.1"
+
+
+def test_install_registry_package_not_found(weld: WeldRunner) -> None:
+    repo = _make_tools_repo(
+        weld.root, {"clock": {"version": "1.1.1", "link": "file:///nonexistent"}}
+    )
+    result = weld.fail(
+        "--install", "nope", extra_env={"WELD_TOOLS_GIT_URL": str(repo)}
+    )
+    assert "package not found" in result.stdout
+
+
+def test_update_registry_skips_when_up_to_date(weld: WeldRunner) -> None:
+    wld = _registry_wld(weld.root, "clock.wld", "clock", "1.1.1")
+    repo = _make_tools_repo(
+        weld.root, {"clock": {"version": "1.1.1", "link": wld.resolve().as_uri()}}
+    )
+    env = {"WELD_TOOLS_GIT_URL": str(repo)}
+    weld.ok("--install", "clock", extra_env=env)
+
+    result = weld.ok("--update", "clock", extra_env=env)
+    assert "Already up to date" in result.stdout
+    assert weld.packages()["clock"]["version"] == "1.1.1"
+
+
+def test_update_registry_downloads_newer_version(weld: WeldRunner) -> None:
+    old = _registry_wld(weld.root, "clock-old.wld", "clock", "1.1.1")
+    repo = _make_tools_repo(
+        weld.root, {"clock": {"version": "1.1.1", "link": old.resolve().as_uri()}}
+    )
+    env = {"WELD_TOOLS_GIT_URL": str(repo)}
+    weld.ok("--install", "clock", extra_env=env)
+
+    new = _registry_wld(weld.root, "clock-new.wld", "clock", "1.1.2")
+    _write_list(repo, {"clock": {"version": "1.1.2", "link": new.resolve().as_uri()}})
+
+    result = weld.ok("--update", "clock", extra_env=env)
+    assert "Updating" in result.stdout
+    assert weld.packages()["clock"]["version"] == "1.1.2"
+    assert "compiled-clock" in weld.ok("--run", "clock").stdout
+
+
+def test_update_all_updates_installed_packages(weld: WeldRunner) -> None:
+    clock_old = _registry_wld(weld.root, "clock-old.wld", "clock", "1.1.1")
+    helper = _registry_wld(weld.root, "helper.wld", "helper", "2.0.0")
+    repo = _make_tools_repo(
+        weld.root,
+        {
+            "clock": {"version": "1.1.1", "link": clock_old.resolve().as_uri()},
+            "helper": {"version": "2.0.0", "link": helper.resolve().as_uri()},
+        },
+    )
+    env = {"WELD_TOOLS_GIT_URL": str(repo)}
+
+    weld.ok("--install", "clock", extra_env=env)
+    weld.ok("--install", "helper", extra_env=env)
+    # A package that is not in the registry at all.
+    local = _registry_wld(weld.root, "localapp.wld", "localapp", "3.0.0")
+    weld.ok("--install", str(local))
+
+    # Bump clock; helper stays the same; localapp is absent from the registry.
+    clock_new = _registry_wld(weld.root, "clock-new.wld", "clock", "1.1.2")
+    _write_list(
+        repo,
+        {
+            "clock": {"version": "1.1.2", "link": clock_new.resolve().as_uri()},
+            "helper": {"version": "2.0.0", "link": helper.resolve().as_uri()},
+        },
+    )
+
+    result = weld.ok("--update-all", extra_env=env)
+    assert "Updated: clock" in result.stdout
+    assert "Update summary" in result.stdout
+    assert weld.packages()["clock"]["version"] == "1.1.2"
+    assert weld.packages()["helper"]["version"] == "2.0.0"
+    assert weld.packages()["localapp"]["version"] == "3.0.0"
+    assert "not in registry" in result.stdout
+
+
+def test_update_all_skips_pinned_packages(weld: WeldRunner) -> None:
+    wld = _registry_wld(weld.root, "clock.wld", "clock", "1.1.1")
+    repo = _make_tools_repo(
+        weld.root, {"clock": {"version": "1.1.1", "link": wld.resolve().as_uri()}}
+    )
+    env = {"WELD_TOOLS_GIT_URL": str(repo)}
+    weld.ok("--install", "clock", extra_env=env)
+    weld.ok("--pin", "clock")
+
+    new = _registry_wld(weld.root, "clock-new.wld", "clock", "1.1.2")
+    _write_list(repo, {"clock": {"version": "1.1.2", "link": new.resolve().as_uri()}})
+
+    result = weld.ok("--update-all", extra_env=env)
+    assert "pinned" in result.stdout
+    assert weld.packages()["clock"]["version"] == "1.1.1"

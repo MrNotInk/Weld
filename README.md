@@ -16,7 +16,10 @@ A fast, lightweight Python application packaging and distribution tool designed 
 * **Custom Tool Options**: Add or remove saved Nuitka/Ruff options with `-Wnuitka` / `-Enuitka` / `-Wruff` / `-Eruff` (e.g. `weld -Wruff "--ignore=F401"`).
 * **Package Archives (`.wld`)**: Archives your Python binaries, libraries, configurations, Readmes, and Changelogs into portable `.wld` files.
 * **Dependency Management**: Automatically manages and installs PyPI dependencies via `uv` or `pip` (can be disabled with `auto_pip_install = false`).
-* **Package Lifecycle**: Supports installing, updating, pinning/unpinning, running, searching, duplicating, renaming, and removing packages.
+* **Package Lifecycle**: Supports installing (from local `.wld` archives or
+  the `Weld_tools` registry), updating (single package or all at once with
+  `--update-all`), pinning/unpinning, running, searching, duplicating,
+  renaming, and removing packages.
 * **Health & History Tracking**: Includes a diagnostic doctor (`--doctor`), environment verification (`--verify`), orphaned file cleaner (`--clean`), and action history log (`--history`).
 * **Shell Completions**: Generates Zsh auto-completion scripts out of the box.
 
@@ -98,16 +101,54 @@ python weld.py --template cli          # run inside myapp/
 python weld.py --build myapp           # -> myapp.wld
 
 # Install, run, inspect and remove
-python weld.py --install myapp.wld
+python weld.py --install myapp.wld     # local archive
+python weld.py --install ./myapp       # finds myapp.wld in the current dir
+python weld.py --install clock         # registry name -> downloads via list.json
 python weld.py --run myapp --help
 python weld.py --list
 python weld.py --info myapp
+python weld.py --update clock         # update one package (registry or local)
+python weld.py --update-all           # update every installed package
 python weld.py --verify
 python weld.py --remove myapp
 ```
 
 `--run` must be the last weld option: everything after the package name is
 forwarded to the installed binary unchanged.
+
+## 🌐 Remote packages (Weld_tools registry)
+
+`--install <name>` and `--update <name>` accept a bare package name. When
+the argument is not a local path (it does not start with `./` and is not an
+existing file/directory), weld clones
+[`MrNotInk/Weld_tools`](https://github.com/MrNotInk/Weld_tools), reads
+`list.json`, and downloads the archive from the `link` of the matching
+entry:
+
+```json
+{
+  "clock": {
+    "version": "1.1.1",
+    "link": "https://github.com/MrNotInk/clock/releases/download/v1.1.1/clock.wld"
+  }
+}
+```
+
+- `weld --install clock` — downloads the archive from the `link` and
+  installs it. A name that is not in `list.json` prints
+  `package not found`.
+- `weld --update clock` — reinstalls the package from the registry only
+  when the registry `version` is newer than the installed one; otherwise it
+  prints `Already up to date`.
+- `weld --update-all` — updates every installed package from the registry.
+  Pinned packages, packages missing from the registry, and packages already
+  on the registry version are skipped; a summary is printed at the end.
+- Local paths keep working exactly as before: `--install ./clock` looks for
+  `clock.wld` in the current directory, and `--install <dir>` looks for
+  `<name>.wld` inside the directory.
+- The Readme and Changelog shipped inside the archive are stored per
+  package in `~/.weld/Readme/` (and are removed when an archive no longer
+  contains them).
 
 ## 🧪 Tests
 

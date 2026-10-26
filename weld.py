@@ -46,7 +46,7 @@ except ImportError:
 
 console = Console()
 
-VERSION = "0.4.0"
+VERSION = "0.5.0"
 
 WELD_DIR       = os.path.expanduser("~/.weld")
 WELD_BIN       = os.path.join(WELD_DIR, "bin")
@@ -71,6 +71,15 @@ REPO_API_WELD_URL    = f"https://api.github.com/repos/{WELD_REPO}/contents/weld.
 RELEASE_VERSION_URL = f"https://github.com/{WELD_REPO}/releases/download/{WELD_RELEASE_TAG}/version"
 RELEASE_WELD_URL    = f"https://github.com/{WELD_REPO}/releases/download/{WELD_RELEASE_TAG}/weld"
 RELEASE_API_URL     = f"https://api.github.com/repos/{WELD_REPO}/releases/latest"
+REPO_RAW_README_URL    = f"https://raw.githubusercontent.com/{WELD_REPO}/main/README.md"
+REPO_RAW_CHANGELOG_URL = f"https://raw.githubusercontent.com/{WELD_REPO}/main/CHANGELOG.md"
+
+# Weld_tools registry: list.json maps package name -> {"version", "link"}.
+# Used by --install <name> / --update <name> / --update-all when the
+# argument is not a local .wld archive.
+WELD_TOOLS_REPO     = "MrNotInk/Weld_tools"
+WELD_TOOLS_GIT_URL  = f"https://github.com/{WELD_TOOLS_REPO}.git"
+WELD_TOOLS_LIST_URL = f"https://raw.githubusercontent.com/{WELD_TOOLS_REPO}/main/list.json"
 LOCAL_BIN_DIR       = os.path.expanduser("~/.local/bin")
 LOCAL_BIN_WELD      = os.path.join(LOCAL_BIN_DIR, "weld")
 
@@ -2018,7 +2027,192 @@ def _copy_tree_tracked(
     return tracked
 
 
+# ---------------------------------------------------------------------------
+# Weld_tools registry (list.json) — resolves package names to downloads
+# ---------------------------------------------------------------------------
+
+def _looks_like_path(arg: str) -> bool:
+    """Return True when *arg* is a filesystem path instead of a package name."""
+    return (
+        arg.startswith(("./", "/", "~"))
+        or arg.endswith(WLD_EXT)
+        or os.sep in arg
+        or os.path.isfile(arg)
+        or os.path.isdir(arg)
+    )
+
+
+def _find_local_wld(arg: str) -> str:
+    """
+    Resolve a local install/update argument to a .wld archive.
+
+    ``./clock`` looks for ``clock.wld`` in the current directory;
+    ``clock.wld`` / ``/abs/clock.wld`` use the file directly; a directory
+    argument looks for ``<name>.wld`` inside itself.
+    """
+    arg = arg.strip()
+    if arg.startswith("~"):
+        arg = os.path.expanduser(arg)
+
+    if os.path.isfile(arg):
+        return os.path.abspath(arg)
+
+    with_ext = arg + WLD_EXT
+    if os.path.isfile(with_ext):
+        return os.path.abspath(with_ext)
+
+    if os.path.isdir(arg):
+        name = os.path.basename(os.path.normpath(arg))
+        if name and name not in (".", ".."):
+            inside = os.path.join(arg, f"{name}{WLD_EXT}")
+            if os.path.isfile(inside):
+                return os.path.abspath(inside)
+
+    console.print(f"[red]Error:[/red] wld archive not found: {_esc(arg)}")
+    _print(
+        f"{_DIM}Looked for: {_esc(os.path.abspath(arg))}  and  "
+        f"{_esc(os.path.abspath(with_ext))}{_RESET}"
+    )
+    raise SystemExit(1)
+
+
+def _fetch_registry() -> dict:
+    """
+    Fetch the Weld_tools registry (list.json).
+
+    Clones https://github.com/MrNotInk/Weld_tools.git (shallow) and reads
+    ``list.json``; falls back to the raw URL when git is unavailable or the
+    clone fails.
+
+    Returns a dict: ``{package_name: {"version": ..., "link": ...}}``.
+    """
+    git = shutil.which("git")
+    if git:
+        repo_url = os.environ.get("WELD_TOOLS_GIT_URL") or WELD_TOOLS_GIT_URL
+        branch = os.environ.get("WELD_TOOLS_GIT_BRANCH") or "main"
+        tmp_parent = tempfile.mkdtemp(prefix="weld-tools-")
+        clone_dir = os.path.join(tmp_parent, "repo")
+        try:
+            for attempt_branch in ([branch] if branch else []) + [None]:
+                if os.path.exists(clone_dir):
+                    shutil.rmtree(clone_dir, ignore_errors=True)
+                cmd = [git, "clone", "--depth", "1"]
+                if attempt_branch:
+                    cmd += ["--branch", attempt_branch]
+                cmd += [repo_url, clone_dir]
+                result = subprocess.run(
+                    cmd, capture_output=True, text=True, timeout=60, check=False
+                )
+                if result.returncode == 0 and os.path.isfile(
+                    os.path.join(clone_dir, "list.json")
+                ):
+                    break
+            else:
+                raise RuntimeError(
+                    f"git clone failed: "
+                    f"{(result.stderr or result.stdout).strip()[:500]}"
+                )
+            with open(os.path.join(clone_dir, "list.json"), encoding="utf-8") as fp:
+                registry = json.load(fp)
+            _print(f"{_DIM}Registry: {repo_url} (git clone){_RESET}")
+            return registry
+        except Exception as exc:
+            _print(
+                f"{_YELLOW}git clone failed ({_esc(str(exc))}), "
+                "trying raw URL...{_RESET}"
+            )
+        finally:
+            shutil.rmtree(tmp_parent, ignore_errors=True)
+
+    try:
+        registry = json.loads(_fetch_url_text(WELD_TOOLS_LIST_URL, timeout=15))
+        _print(f"{_DIM}Registry: {WELD_TOOLS_LIST_URL} (raw){_RESET}")
+        return registry
+    except Exception as exc:
+        console.print(
+            f"[red]Error:[/red] Could not fetch the Weld_tools registry "
+            f"(list.json): {_esc(str(exc))}"
+        )
+        raise SystemExit(1)
+
+
+def _download_wld(url: str, dest: str) -> None:
+    """Download the .wld archive at *url* into *dest* (overwrites it)."""
+    data = _fetch_url_bytes(url, timeout=60)
+    with open(dest, "wb") as fp:
+        fp.write(data)
+
+
+def _resolve_wld_source(
+    arg: str, installed_version: str | None = None
+) -> tuple[str | None, str | None, dict | None]:
+    """
+    Resolve an --install/--update argument to a local .wld archive.
+
+    * Path-like arguments (``./...``, absolute paths, existing files or
+      directories) are looked up on disk.
+    * Everything else is treated as a package name and resolved through the
+      Weld_tools registry: the archive is downloaded from the ``link`` found
+      in list.json.
+
+    Returns ``(wld_path, temp_file, registry_entry)``:
+      - *wld_path* is the archive to install (None when a registry update
+        found no newer version and the caller asked for one);
+      - *temp_file*, when set, is a downloaded archive that the caller must
+        delete when done;
+      - *registry_entry* is the registry record for the package (None for
+        local archives).
+    """
+    if _looks_like_path(arg):
+        return _find_local_wld(arg), None, None
+
+    name = arg.strip()
+    _print(f"{_DIM}Resolving '{name}' from the Weld_tools registry ...{_RESET}")
+
+    registry = _fetch_registry()
+    entry = registry.get(name)
+    if not isinstance(entry, dict) or not str(entry.get("link", "")).strip():
+        console.print(f"[red]Error:[/red] package not found: {_esc(name)}")
+        raise SystemExit(1)
+
+    version = str(entry.get("version", "")).strip()
+    link    = str(entry["link"]).strip()
+    entry   = {"version": version, "link": link}
+
+    # Update path: skip the download when the registry version is not newer
+    # than the installed one.
+    if installed_version and version and not _is_newer_version(version, installed_version):
+        return None, None, entry
+
+    _print(f"{_DIM}Registry version: {version or 'unknown'}  {link}{_RESET}")
+    fd, tmp_path = tempfile.mkstemp(prefix=f"weld-{name}-", suffix=WLD_EXT)
+    os.close(fd)
+    try:
+        with spinner(f"Downloading {link}"):
+            _download_wld(link, tmp_path)
+        _print(f"{_DIM}Downloaded {os.path.getsize(tmp_path)} bytes{_RESET}")
+    except Exception as exc:
+        if os.path.exists(tmp_path):
+            os.remove(tmp_path)
+        console.print(f"[red]Error:[/red] Download failed: {_esc(str(exc))}")
+        raise SystemExit(1)
+    return tmp_path, tmp_path, entry
+
+
 def cmd_install(wld_file: str, log_action: bool = True) -> None:
+    """Resolve *wld_file* (a local path or a registry name) and install it."""
+    path, tmp_file, _entry = _resolve_wld_source(wld_file)
+    try:
+        _cmd_install(path, log_action)
+    finally:
+        if tmp_file and os.path.exists(tmp_file):
+            try:
+                os.remove(tmp_file)
+            except OSError:
+                pass
+
+
+def _cmd_install(wld_file: str, log_action: bool = True) -> None:
     wld_file = os.path.abspath(wld_file)
 
     if not os.path.isfile(wld_file):
@@ -2312,6 +2506,47 @@ def cmd_install(wld_file: str, log_action: bool = True) -> None:
 
 
 def cmd_update(wld_file: str) -> None:
+    """
+    Update an installed package.
+
+    *wld_file* is resolved the same way as for ``--install``: a local .wld
+    archive/path (``./clock`` finds ``clock.wld`` in the current directory)
+    or a registry name (in which case the archive is downloaded from the
+    link in list.json).  Registry updates skip the download when the
+    registry version is not newer than the installed one.
+    """
+    installed_version = None
+    if not _looks_like_path(wld_file):
+        try:
+            with _packages_lock():
+                info = load_packages().get(wld_file.strip())
+            if isinstance(info, dict):
+                installed_version = str(info.get("version", "")).strip() or None
+        except Exception:
+            pass
+
+    path, tmp_file, entry = _resolve_wld_source(
+        wld_file, installed_version=installed_version
+    )
+    if path is None:
+        version = (entry or {}).get("version", "?")
+        _print(
+            f"\n{_GREEN}✔ Already up to date:{_RESET} {wld_file} "
+            f"{_DIM}(installed {installed_version or '?'} = registry {version}){_RESET}"
+        )
+        return
+
+    try:
+        _cmd_update(path)
+    finally:
+        if tmp_file and os.path.exists(tmp_file):
+            try:
+                os.remove(tmp_file)
+            except OSError:
+                pass
+
+
+def _cmd_update(wld_file: str) -> None:
     wld_file = os.path.abspath(wld_file)
     if not os.path.isfile(wld_file):
         console.print(f"[red]Error:[/red] File '{_esc(wld_file)}' not found")
@@ -2345,13 +2580,92 @@ def cmd_update(wld_file: str) -> None:
             f"{old_info.get('version', '?')} -> {config['version']}"
         )
 
-    # cmd_install() compiles everything in a temporary directory and only
+    # _cmd_install() compiles everything in a temporary directory and only
     # touches the installed files once compilation succeeded, so a failed
     # update leaves the previous version intact and installed.
-    cmd_install(wld_file, log_action=False)
+    _cmd_install(wld_file, log_action=False)
 
     _call_hook(global_plugin, "after_update", config)
     _log("UPDATE" if old_info is not None else "INSTALL", pkg_name, config["version"])
+
+
+def cmd_update_all() -> None:
+    """
+    Update every installed package from the Weld_tools registry.
+
+    Pinned packages, packages not present in the registry, and packages that
+    are already on the registry version are skipped; the rest are downloaded
+    from their registry link and installed.
+    """
+    with _packages_lock():
+        packages = load_packages()
+    if not packages:
+        _print(f"{_DIM}No packages installed.{_RESET}")
+        return
+
+    _print(f"{_BOLD}{_CYAN}Checking all packages for updates...{_RESET}")
+    registry = _fetch_registry()
+
+    updated: list[str] = []
+    current: list[str] = []
+    missing: list[str] = []
+    pinned: list[str] = []
+
+    for name in sorted(packages):
+        info = packages[name]
+        if info.get("pinned"):
+            pinned.append(name)
+            _print(f"{_YELLOW}Skipped:{_RESET} {name} {_DIM}(pinned){_RESET}")
+            continue
+
+        entry = registry.get(name)
+        if not isinstance(entry, dict) or not str(entry.get("link", "")).strip():
+            missing.append(name)
+            _print(f"{_DIM}Skipped:{_RESET} {name} {_DIM}(not in registry){_RESET}")
+            continue
+
+        remote_version = str(entry.get("version", "")).strip()
+        local_version  = str(info.get("version", "")).strip()
+        if remote_version and not _is_newer_version(remote_version, local_version):
+            current.append(name)
+            _print(
+                f"{_GREEN}✔{_RESET} {name} {local_version or '?'} "
+                f"{_DIM}(registry {remote_version}){_RESET}"
+            )
+            continue
+
+        fd, tmp_path = tempfile.mkstemp(prefix=f"weld-{name}-", suffix=WLD_EXT)
+        os.close(fd)
+        try:
+            _print(
+                f"{_CYAN}Updating:{_RESET} {name} {local_version or '?'} "
+                f"-> {remote_version or '?'}"
+            )
+            with spinner(f"Downloading {entry['link']}"):
+                _download_wld(str(entry["link"]), tmp_path)
+            cfg = _read_archive_config(tmp_path)
+            _cmd_install(tmp_path, log_action=False)
+            _log("UPDATE", name, cfg["version"])
+            updated.append(name)
+            _print(f"{_GREEN}✔ Updated:{_RESET} {name} {cfg['version']}")
+        except SystemExit:
+            console.print(f"[red]Error:[/red] {_esc(name)}: update failed (see above)")
+        except Exception as exc:
+            console.print(f"[red]Error:[/red] {_esc(name)}: {_esc(str(exc))}")
+        finally:
+            if os.path.exists(tmp_path):
+                try:
+                    os.remove(tmp_path)
+                except OSError:
+                    pass
+
+    _print(
+        f"\n{_BOLD}Update summary:{_RESET} "
+        f"{len(updated)} updated, {len(current)} up to date, "
+        f"{len(missing)} not in registry, {len(pinned)} pinned"
+    )
+    if updated:
+        _print(f"{_DIM}Updated: {', '.join(updated)}{_RESET}")
 
 
 def cmd_new(folder_name: str) -> None:
@@ -3348,8 +3662,9 @@ _weld() {{
         '--list-sort[Sort key]:key:(name version installed_at updated_at)'
         '--list-filter[Filter welds]:filter:'
         '--build[Build a folder into a .wld archive]:folder:_files -/'
-        '--install[Install a .wld package]:file:_files -g "*.wld"'
-        '--update[Update an installed package]:file:_files -g "*.wld"'
+        '--install[Install a package (.wld file, ./path or registry name)]:file:_files -g "*.wld"'
+        '--update[Update an installed package (.wld file, ./path or registry name)]:file:_files -g "*.wld"'
+        '--update-all[Update all installed packages from the registry]'
         '--new[Create a new weld project skeleton]:folder:_files -/'
         '--remove[Remove an installed weld]:package:_weld_packages'
         '--info[Show info about a weld]:package:_weld_packages'
@@ -3396,6 +3711,30 @@ _weld
 # ---------------------------------------------------------------------------
 # Self-upgrade helpers
 # ---------------------------------------------------------------------------
+
+def _store_weld_docs() -> None:
+    """
+    Store weld's own README.md and CHANGELOG.md into ~/.weld so they can be
+    read (or edited) later, e.g. ``weld --edit weld``.  Failures are ignored:
+    the self-upgrade itself already succeeded.
+    """
+    try:
+        os.makedirs(WELD_README, exist_ok=True)
+        for url, dest in (
+            (REPO_RAW_README_URL, readme_path_for("weld")),
+            (REPO_RAW_CHANGELOG_URL, changelog_path_for("weld")),
+        ):
+            try:
+                data = _fetch_url_bytes(url, timeout=15)
+                if data:
+                    with open(dest, "wb") as fp:
+                        fp.write(data)
+                    _print(f"{_DIM}Stored {os.path.basename(dest)}{_RESET}")
+            except Exception:
+                pass
+    except Exception:
+        pass
+
 
 def _parse_version(v: str) -> tuple[int, ...]:
     """Parse a version string into a comparable tuple of ints."""
@@ -4188,6 +4527,10 @@ def cmd_self_upgrade(force: bool = False, yes: bool = False) -> None:
     except Exception:
         pass
 
+    # Refresh weld's own Readme/Changelog so the new version can be inspected
+    # (and edited) later, e.g. `weld --edit weld`.
+    _store_weld_docs()
+
     _print(f"\n{_GREEN}{_BOLD}Upgrade complete!{_RESET}  {VERSION} → {remote_version}")
     _print(f"{_DIM}Run: {dest} --version  to confirm. If 'weld' command not found, restart your shell.{_RESET}")
     # Also mention direct python fallback
@@ -4231,6 +4574,10 @@ def main() -> None:
         epilog=(
             "NOTE: --run must be the last flag; everything after the package name "
             "is forwarded to the binary.  Example: weld --run mypkg --verbose\n"
+            "Package names without a path (e.g. weld --install clock) are looked "
+            "up in the Weld_tools registry (https://github.com/MrNotInk/Weld_tools) "
+            "and downloaded from the link in list.json; local paths like "
+            "./clock find clock.wld in the current directory.\n"
             "Tool options: -Wnuitka/-Wruff add and -Enuitka/-Eruff remove saved "
             "Nuitka/Ruff options in ~/.weld/config.toml; they can be used alone "
             "or combined with --build/--install/--update and apply immediately."
@@ -4242,8 +4589,15 @@ def main() -> None:
     parser.add_argument("--list-sort",    metavar="<key>",       default="name")
     parser.add_argument("--list-filter",  metavar="<key=glob>",  default="")
     parser.add_argument("--build",        metavar="<folder>")
-    parser.add_argument("--install",      metavar="<file>")
-    parser.add_argument("--update",       metavar="<file>")
+    parser.add_argument("--install",      metavar="<file|package>",
+                        help="Install a .wld archive (local path, e.g. ./clock) "
+                             "or a package from the Weld_tools registry")
+    parser.add_argument("--update",       metavar="<file|package>",
+                        help="Update a package (local .wld archive or "
+                             "Weld_tools registry name)")
+    parser.add_argument("--update-all",   action="store_true",
+                        help="Update all installed packages from the "
+                             "Weld_tools registry")
     parser.add_argument("--new",          metavar="<folder>")
     parser.add_argument("--remove",       metavar="<package>")
     parser.add_argument("--info",         metavar="<package>")
@@ -4297,6 +4651,8 @@ def main() -> None:
             cmd_install(args.install)
         elif args.update is not None:
             cmd_update(args.update)
+        elif args.update_all:
+            cmd_update_all()
         elif args.new is not None:
             cmd_new(args.new)
         elif args.remove is not None:

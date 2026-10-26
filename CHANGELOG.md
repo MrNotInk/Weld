@@ -7,6 +7,43 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 
 ---
 
+## [0.5.0] - 2026-10-26
+
+### Added
+
+- **Remote installs from the `Weld_tools` registry** — `weld --install
+  <name>` and `weld --update <name>` now accept a bare package name. weld
+  clones `https://github.com/MrNotInk/Weld_tools.git`, reads `list.json`
+  (each entry has a `version` and a download `link`), and installs the
+  archive from that link. A name that is not in `list.json` prints
+  `package not found`.
+- **Local path installs** — arguments that start with `./` (or that are
+  existing files/directories) look for the `.wld` archive on disk:
+  `weld --install ./clock` installs `clock.wld` from the current directory;
+  a directory argument looks for `<name>.wld` inside itself.
+- **`--update-all`** — updates every installed package from the registry.
+  Pinned packages, packages missing from the registry, and packages that are
+  already on the registry version are skipped, and a summary
+  (`N updated, M up to date, ...`) is printed at the end.
+- **Registry-aware `--update`** — a registry update only downloads when the
+  registry `version` is newer than the installed one (prints `Already up to
+  date` otherwise); local archives keep the old always-reinstall behaviour.
+- **Self-upgrade refreshes weld's own Readme/Changelog** — after
+  `weld --self-upgrade` the new `README.md` / `CHANGELOG.md` are stored in
+  `~/.weld/Readme/` as `weld-Readme` / `weld-Changelog`, so `weld --edit
+  weld` works with the upgraded version.
+- Zsh completions updated for `--update-all` and the new registry
+  arguments of `--install` / `--update`.
+
+### Changed
+
+- Version bumped from `0.4.0` to **`0.5.0`** (`VERSION` in `weld.py` and the
+  repo `version` file are kept in sync).
+- `--help` now documents the registry behaviour and the `./path` local
+  lookup.
+
+---
+
 ## [0.4.0] - 2026-10-25
 
 ### Added
