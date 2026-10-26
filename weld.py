@@ -46,7 +46,7 @@ except ImportError:
 
 console = Console()
 
-VERSION = "0.5.0"
+VERSION = "0.5.1"
 
 WELD_DIR       = os.path.expanduser("~/.weld")
 WELD_BIN       = os.path.join(WELD_DIR, "bin")
@@ -1730,6 +1730,27 @@ def _compile_nuitka_live(
     )
 
 
+def _find_c_compiler() -> str | None:
+    """
+    Return the C compiler command that setuptools will use for C builds,
+    or None when it is not installed.
+
+    Python's configured compiler (``sysconfig`` CC, e.g. ``gcc-13`` or
+    ``x86_64-linux-gnu-gcc``) takes precedence — when it is not on PATH the
+    build would fail, so it is reported as missing even if another compiler
+    (gcc/clang) happens to be installed.
+    """
+    import sysconfig
+
+    cc_cfg = (sysconfig.get_config_var("CC") or "").strip().split()
+    if cc_cfg:
+        return cc_cfg[0] if shutil.which(cc_cfg[0]) else None
+    for candidate in ("gcc", "cc", "clang"):
+        if shutil.which(candidate):
+            return candidate
+    return None
+
+
 def compile_to_so(python_file: str, inplace: bool = True) -> str:
     if not os.path.exists(python_file):
         raise FileNotFoundError(python_file)
@@ -2365,6 +2386,30 @@ def _cmd_install(wld_file: str, log_action: bool = True) -> None:
                     "Install it with: pip install setuptools"
                 )
                 raise SystemExit(1)
+            if _find_c_compiler() is None:
+                import sysconfig
+                expected = (sysconfig.get_config_var("CC") or "").strip().split()
+                expected_cc = expected[0] if expected else ""
+                if expected_cc:
+                    console.print(
+                        f"[red]Error:[/red] C compiler "
+                        f"'{_esc(expected_cc)}' not found."
+                    )
+                    _print(
+                        f"{_DIM}Python was built expecting '{expected_cc}'. "
+                        f"Install it with: sudo apt install {expected_cc} "
+                        f"(or build-essential){_RESET}"
+                    )
+                else:
+                    console.print(
+                        "[red]Error:[/red] No C compiler found "
+                        "(checked: gcc, cc, clang)."
+                    )
+                    _print(
+                        f"{_DIM}Install one with: sudo apt install "
+                        f"build-essential{_RESET}"
+                    )
+                raise SystemExit(1)
             try:
                 for idx, py_file in enumerate(libs_files, 1):
                     full = os.path.join(tmp_libs, py_file)
@@ -2376,6 +2421,10 @@ def _cmd_install(wld_file: str, log_action: bool = True) -> None:
                             f"[red]Error:[/red] Cython failed for libs/{_esc(py_file)}"
                         )
                         _print(str(exc))
+                        _print(
+                            f"{_DIM}Hint: a Cython build needs a C compiler "
+                            "(gcc) and Python headers (python3-dev).{_RESET}"
+                        )
                         raise SystemExit(1)
                     compiled_libs.append(os.path.basename(so_path).removesuffix(".so"))
                     if os.path.exists(full):
@@ -3268,6 +3317,13 @@ def cmd_doctor() -> None:
         ("uv",          ["uv",            "--version"], False),
         ("zip",         ["zip",           "--version"], False),
         ("unzip",       ["unzip",         "--version"], False),
+        ("git",         ["git",           "--version"], True),
+        ("gcc",         ["gcc",           "--version"], libs_compiler == "cython"),
+        ("make",        ["make",          "--version"], False),
+        ("curl",        ["curl",          "--version"], False),
+        ("wget",        ["wget",          "--version"], False),
+        ("pip",         [sys.executable,  "-m", "pip", "--version"], False),
+        ("gh",          ["gh",            "--version"], False),
     ]
 
     _print(f"\n{_BOLD}{_CYAN}weld doctor{_RESET}\n")
@@ -3300,6 +3356,26 @@ def cmd_doctor() -> None:
                 missing_required.append(name)
             else:
                 rows.append((name, "-", f"{exc} (optional)", "no"))
+
+    # C compiler that Python itself was built with (sysconfig CC, e.g.
+    # 'gcc-13' or 'x86_64-linux-gnu-gcc') — this is what setuptools/Cython
+    # invoke, so it matters even when plain gcc is installed under another
+    # name.
+    import sysconfig
+    cc = _find_c_compiler()
+    expected = (sysconfig.get_config_var("CC") or "").strip().split()
+    expected_cc = expected[0] if expected else ""
+    if cc:
+        detail = cc
+        if expected_cc and cc != expected_cc:
+            detail += f" (python expects {expected_cc})"
+        rows.append(("cc(python)", "✔", detail, "no"))
+    elif expected_cc:
+        rows.append(
+            ("cc(python)", "✘", f"python expects {expected_cc} — not on PATH", "no")
+        )
+    else:
+        rows.append(("cc(python)", "-", "not found (optional)", "no"))
 
     table = Table(box=ROUNDED, header_style="bold cyan", padding=(0, 1))
     table.add_column("Tool",     style="bold white", max_width=14)
