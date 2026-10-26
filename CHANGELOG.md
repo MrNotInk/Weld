@@ -7,6 +7,38 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 
 ---
 
+## [0.5.1] - 2026-10-26
+
+### Fixed
+
+- **Missing C compiler now fails fast with a helpful message.** Installing a
+  package whose archive contains `libs/*.py` (e.g. `weld --install clock`)
+  used to die with the raw setuptools error
+  `error: [Errno 2] No such file or directory: 'gcc-13'` when the C
+  compiler Python was built with was not installed. Weld now pre-checks the
+  compiler (`sysconfig` `CC`, e.g. `gcc-13` or `x86_64-linux-gnu-gcc`)
+  before compiling libs and prints
+  `C compiler 'gcc-13' not found. ... Install it with: sudo apt install
+  gcc-13 (or build-essential)` instead. A hint (C compiler + `python3-dev`
+  headers) is also printed after any other Cython failure.
+
+### Added
+
+- **`--doctor` now reports manually installed CLI tools** in addition to the
+  Python toolchain: `git` (marked required — registry installs and
+  self-upgrade depend on it), `gcc` (marked required when
+  `libs_compiler = "cython"`), `make`, `curl`, `wget`, `pip` and `gh`.
+  A dedicated `cc(python)` row shows whether the C compiler Python itself
+  was built with is available, surfacing cases like "plain gcc installed
+  but Python expects gcc-13".
+
+### Changed
+
+- Version bumped from `0.5.0` to **`0.5.1`** (`VERSION` in `weld.py` and the
+  repo `version` file are kept in sync).
+
+---
+
 ## [0.5.0] - 2026-10-26
 
 ### Added

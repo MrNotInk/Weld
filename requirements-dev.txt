@@ -11,3 +11,8 @@ tomli-w>=1.0.0
 tomli>=2.0.0; python_version < "3.11"
 ruff>=0.5.0
 pytest>=8.0.0
+# Cython + setuptools are needed to exercise the libs/*.py -> .so path
+# (the real C compiler is never invoked by the tests; the pre-flight check
+# is what the missing-compiler test exercises).
+cython>=3.0.0
+setuptools>=68.0.0

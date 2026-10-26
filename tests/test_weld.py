@@ -1150,3 +1150,34 @@ def test_update_all_skips_pinned_packages(weld: WeldRunner) -> None:
     result = weld.ok("--update-all", extra_env=env)
     assert "pinned" in result.stdout
     assert weld.packages()["clock"]["version"] == "1.1.1"
+
+
+# ---------------------------------------------------------------------------
+# doctor: manually installed CLI tools + C compiler pre-flight
+# ---------------------------------------------------------------------------
+
+def test_doctor_lists_cli_tools(weld: WeldRunner) -> None:
+    result = weld.ok("--doctor")
+    for tool in ("git", "gcc", "make", "curl", "wget", "pip", "gh",
+                 "cc(python)"):
+        assert tool in result.stdout, f"{tool} missing from doctor output"
+
+
+def test_install_libs_missing_c_compiler(weld: WeldRunner) -> None:
+    archive = make_archive(
+        weld.root / "clock.wld",
+        {"name": "clock", "version": "1.0.0", "deps": [], "desc": "clock"},
+        {"bin/main.py": "print('hi')\n", "bin/libs/helper.py": "x = 1\n"},
+    )
+    # PATH without /usr/bin: no C compiler is visible. The venv bin is
+    # kept so the fake nuitka shim (#!/usr/bin/env python3) can run.
+    result = weld.fail(
+        "--install", str(archive),
+        path=f"{weld.root / 'fakebin'}:{VENV_BIN}",
+    )
+    assert "C compiler" in result.stdout
+    assert "not found" in result.stdout
+    assert "sudo apt install" in result.stdout
+
+    assert weld.packages() == {}
+    assert not (weld.bin_dir / "clock").exists()
