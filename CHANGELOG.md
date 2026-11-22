@@ -7,6 +7,20 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 
 ---
 
+## [Unreleased]
+
+### Added
+
+- `docs/` with focused guides, linked from the README:
+  `project.md` (manual project layout, `config.json`, `bin/libs/`, building and
+  zipping an archive, common mistakes), `weld.md` (every command, build/install/
+  run, registry installs, `~/.weld` state, error logs, self-upgrade),
+  `config.md` (`config.json`, `~/.weld/config.toml`, registry `list.json`,
+  `packages.json`), `plugins.md` (hook reference and examples) and
+  `templates.md` (built-in and user templates).
+
+---
+
 ## [0.6.4] - 2026-11-22
 
 ### Added
