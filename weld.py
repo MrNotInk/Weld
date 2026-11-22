@@ -47,7 +47,7 @@ except ImportError:
 
 console = Console()
 
-VERSION = "0.6.0"
+VERSION = "0.6.1"
 
 WELD_DIR       = os.path.expanduser("~/.weld")
 WELD_BIN       = os.path.join(WELD_DIR, "bin")
@@ -1603,17 +1603,48 @@ def remove_changelog(pkg_name: str, silent: bool = False) -> None:
 # Compilers
 # ---------------------------------------------------------------------------
 
+def _gil_enabled_shebang(shebang: bytes) -> bytes:
+    """Preserve a Python command but explicitly enable the GIL at startup.
+
+    env -S lets the kernel's single shebang argument carry interpreter flags.
+    Keep the original command's quoting and flags, including env assignments.
+    """
+    command = shebang.removeprefix(b"#!").strip()
+    parts = command.split(None, 1)
+    if not parts:
+        raise ValueError("Missing interpreter in Python shebang")
+
+    env = b"/usr/bin/env"
+    if os.path.basename(parts[0]) == b"env":
+        env = parts[0]
+        command = parts[1] if len(parts) > 1 else b""
+        command = re.sub(br"^(?:-S\s*|--split-string(?:=|\s+))", b"", command)
+    if not command:
+        raise ValueError("Missing Python command in env shebang")
+
+    # The startup option must precede Python's optional end-of-options marker.
+    terminator = b""
+    marker = re.search(br"\s+--$", command)
+    if marker:
+        command = command[:marker.start()]
+        terminator = b" --"
+    return b"#!" + env + b" -S " + command + b" -X gil=1" + terminator + b"\n"
+
+
 def compile_py_nuitka(
     full_path: str, cwd: str,
     line_cb=None,
     opts: list[str] | None = None,
+    *, enable_gil: bool = False,
 ) -> subprocess.CompletedProcess:
     """Turn a .py file into an executable Python script without Nuitka.
 
     Relative paths are resolved against *cwd*. The output is next to the
     source with only the final .py suffix removed. An existing shebang is
     preserved; otherwise /usr/bin/env python3 is used. Execute bits are
-    added without changing the other permissions.
+    added without changing the other permissions. *enable_gil* adds -X gil=1
+    to the shebang for Cython libraries built on free-threaded Python, without
+    changing the script body or declaring those libraries GIL-independent.
 
     The legacy name, *opts* (ignored), callback, and CompletedProcess return
     value are retained for compatibility. The source is removed only after
@@ -1644,6 +1675,10 @@ def compile_py_nuitka(
                 # after inserting the shebang (PEP 263 only checks two lines).
                 header += f"# coding: {encoding}\n".encode("ascii")
             script = header + source
+
+        if enable_gil:
+            shebang, _, body = script.partition(b"\n")
+            script = _gil_enabled_shebang(shebang) + body
 
         with open(output, "xb") as fp:
             created_output = True
@@ -1698,10 +1733,11 @@ def compile_py_pyinstaller(full_path: str, cwd: str) -> subprocess.CompletedProc
 
 
 def _compile_nuitka_live(
-    full_path: str, cwd: str, label: str, opts: list[str] | None = None
+    full_path: str, cwd: str, label: str, opts: list[str] | None = None,
+    *, enable_gil: bool = False,
 ) -> subprocess.CompletedProcess:
     """Prepare an executable script and display its status (legacy name)."""
-    result = compile_py_nuitka(full_path, cwd, opts=opts)
+    result = compile_py_nuitka(full_path, cwd, opts=opts, enable_gil=enable_gil)
     icon = f"{_GREEN}✔{_RESET}" if result.returncode == 0 else f"{_RED}✘{_RESET}"
     _write(f"\r{_CLEAR_LINE}{icon} {label}\n")
     return result
@@ -2302,6 +2338,12 @@ def _cmd_install(wld_file: str, log_action: bool = True) -> None:
 
         py_files   = filter_files(tmp_bin, ".py")
         libs_files = filter_files(tmp_libs, ".py") if os.path.isdir(tmp_libs) else []
+        enable_gil = False
+        if libs_files:
+            import sysconfig
+            # Cython modules are not necessarily free-threading safe. Start
+            # with the GIL instead of letting their import enable it noisily.
+            enable_gil = sysconfig.get_config_var("Py_GIL_DISABLED") == 1
 
         if py_files:
             if compiler == "nuitka":
@@ -2319,7 +2361,9 @@ def _cmd_install(wld_file: str, log_action: bool = True) -> None:
                     full = os.path.join(tmp_bin, py_file)
                     _progress(idx, len(py_files), py_file)
                     if compiler == "nuitka":
-                        result = _compile_nuitka_live(full, tmp_bin, py_file, opts=nuitka_opts)
+                        result = _compile_nuitka_live(
+                            full, tmp_bin, py_file, opts=nuitka_opts, enable_gil=enable_gil,
+                        )
                     else:
                         with spinner(f"{compiler}  {py_file}"):
                             result = compile_py_pyinstaller(full, tmp_bin)
