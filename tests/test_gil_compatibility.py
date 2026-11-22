@@ -176,14 +176,7 @@ def test_install_applies_gil_compatibility_only_to_free_threaded_native_apps(
             return 1 if free_threaded else 0
         return original_get_config_var(name)
 
-    def compile_library(path):
-        output = Path(path).with_suffix(".so")
-        output.write_bytes(b"fake native extension")
-        return str(output)
-
     monkeypatch.setattr(sysconfig, "get_config_var", get_config_var)
-    monkeypatch.setattr(weld_module, "_find_c_compiler", lambda: "fake-gcc")
-    monkeypatch.setattr(weld_module, "compile_to_so", compile_library)
     archive = tmp_path / "clock.wld"
     with zipfile.ZipFile(archive, "w") as zf:
         zf.writestr("config.json", json.dumps({"name": "clock", "version": "1.1.1"}))
@@ -213,4 +206,9 @@ def test_install_applies_gil_compatibility_only_to_free_threaded_native_apps(
     )
     assert json.loads(through_weld.stdout)["gil"] == ("1" if needs_gil else None)
     assert json.loads(through_weld.stdout)["args"] == ["two words"]
-    assert weld_module.load_packages()["clock"]["libs"] == (["_clock"] if has_libs else [])
+    info = weld_module.load_packages()["clock"]
+    assert info["_lib_files"] == (["_clock.py"] if has_libs else [])
+    if has_libs:
+        copied = Path(weld_module.WELD_LIBS) / "_clock.py"
+        assert copied.read_text(encoding="utf-8") == "def now(): return '9:44:22'\n"
+        assert not (Path(weld_module.WELD_LIBS) / "_clock.so").exists()

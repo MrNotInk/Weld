@@ -7,6 +7,38 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 
 ---
 
+## [0.6.3] - 2026-11-22
+
+### Changed
+
+- **`bin/libs/` is now installed as-is instead of being compiled with
+  Cython**, the same way executable script mode works. Every file in the
+  archive's `bin/libs/` (`.py` modules, prebuilt `.so` extensions, packages
+  and data) is copied unmodified into `~/.weld/bin/libs/` with its relative
+  layout preserved. Fixes `weld --install clock` dying with a silent
+  `SIGSEGV` (exit code `-11`) in the Cython/setuptools build subprocess on
+  CPython 3.15 pre-releases, and removes the whole class of native-build
+  failures (missing compiler, headers, unsupported Python).
+- No Cython, setuptools, C compiler, or Python development headers are needed
+  any more; they are no longer checked before installing libraries or probed
+  as required tools by `--doctor` (`cc(python)` remains informational).
+- Copied library files are tracked in `packages.json` under `_lib_files`, so
+  `--verify`, `--remove`, `--clean`, `--addc`, `--update`, rollback of failed
+  installs, and shared-library de-duplication between duplicated packages all
+  work with them. Packages installed by earlier versions (tracked through the
+  old `libs` list) keep working and are removed correctly.
+- The legacy `libs_compiler = "cython"` setting is accepted and ignored; it
+  no longer triggers a build. `--stats` reports
+  `Library install: copy as-is (no compilation)`.
+- Dependency lists no longer require Cython or setuptools.
+
+### Fixed
+
+- Installing a package whose `bin/libs/` contains nested directories, prebuilt
+  extensions, or only non-`.py` files no longer fails or silently skips them.
+
+---
+
 ## [0.6.2] - 2026-11-22
 
 ### Added
