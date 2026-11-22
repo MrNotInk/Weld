@@ -6,14 +6,15 @@ A fast, lightweight Python application packaging and distribution tool designed 
 
 ## 🚀 Overview
 
-**Weld** simplifies Python app distribution by handling validation, compilation, dependency management, and local packaging into portable `.wld` archives. It includes built-in application templates, hooks for lifecycle plugins, concurrent package locking, and automatic compilation via tools like Nuitka, PyInstaller, or Cython.
+**Weld** simplifies Python app distribution by handling validation, executable script preparation, optional native compilation, dependency management, and local packaging into portable `.wld` archives. It includes built-in application templates, hooks for lifecycle plugins, and concurrent package locking.
 
 ## ✨ Features
 
 * **Project Scaffolding**: Quickly create new project structures with ready-to-use templates (Flask, FastAPI, CLI, Daemon, TUI, Scraper, etc.).
 * **Code Validation**: Runs `ruff` checks and bytecode compilation (`py_compile`) before building.
-* **Compilation Engines**: Compiles executables using **Nuitka** or **PyInstaller**, and shared library modules (`.so`) using **Cython**.
-* **Custom Tool Options**: Add or remove saved Nuitka/Ruff options with `-Wnuitka` / `-Enuitka` / `-Wruff` / `-Eruff` (e.g. `weld -Wruff "--ignore=F401"`).
+* **Executable Python Scripts**: The default (legacy `nuitka`) mode removes `.py`, ensures a shebang, and adds execute permissions without invoking Nuitka.
+* **Optional Compilation Engines**: Builds native executables using **PyInstaller**, and shared library modules (`.so`) using **Cython**.
+* **Custom Tool Options**: Add or remove saved Ruff options with `-Wruff` / `-Eruff` (e.g. `weld -Wruff "--ignore=F401"`). Legacy Nuitka option flags remain accepted but are ignored.
 * **Package Archives (`.wld`)**: Archives your Python binaries, libraries, configurations, Readmes, and Changelogs into portable `.wld` files.
 * **Dependency Management**: Automatically manages and installs PyPI dependencies via `uv` or `pip` (can be disabled with `auto_pip_install = false`).
 * **Package Lifecycle**: Supports installing (from local `.wld` archives or
@@ -25,15 +26,15 @@ A fast, lightweight Python application packaging and distribution tool designed 
 
 ## 📋 Prerequisites
 
-* **Python 3.11+** — 3.11 through 3.13 are recommended, because Nuitka and
-  PyInstaller do not always support the newest Python release on day one.
+* **Python 3.11+** — required both for Weld and for installed Python scripts.
   On Python 3.10 and older the `tomli` backport is used automatically.
 * **Linux or macOS** (Weld uses POSIX file locking and `.so` shared libraries).
-* **At least one compiler**: [Nuitka](https://nuitka.net/) or
-  [PyInstaller](https://pyinstaller.org/). Cython is only needed for projects
-  that ship modules in `bin/libs/`.
-* A C toolchain and Python development headers for Cython builds
-  (e.g. `python3-dev` on Debian/Ubuntu).
+* **No executable compiler is needed by default.**
+  [PyInstaller](https://pyinstaller.org/) is only needed when
+  `compiler = "pyinstaller"` is selected. Its support for new Python releases
+  may lag; Python 3.11–3.13 are recommended for that mode.
+* Cython, a C toolchain, and Python development headers (e.g. `python3-dev`
+  on Debian/Ubuntu) are only needed for projects shipping `bin/libs/*.py`.
 
 ### Installation
 
@@ -48,8 +49,33 @@ python weld.py --doctor
 ```
 
 `requirements.txt` installs the runtime dependencies (`rich`, `tomli-w`),
-the validator (`ruff`), and the compilation engines (`cython`, `setuptools`,
-`nuitka`, `pyinstaller`).
+the validator (`ruff`), and optional native build support (`cython`,
+`setuptools`, `pyinstaller`). Nuitka is not needed or installed.
+
+### Updating Weld
+
+With Git installed and your Python environment active, existing users can run:
+
+```bash
+weld --check-update                 # compare with the version on main
+weld --self-upgrade                 # confirm the upgrade when prompted
+~/.local/bin/weld --version         # verify the newly installed copy
+```
+
+Use `weld --self-upgrade --yes` to skip the confirmation prompt. If you run
+Weld from a source checkout rather than a `weld` command, use
+`python weld.py --self-upgrade` instead.
+
+The updater clones `main`, reads the repository's `version` file, and installs
+`weld.py` as `~/.local/bin/weld`. Updating both version values makes `0.6.0`
+detectable as soon as it is merged; no separate release download is needed.
+Make sure `~/.local/bin` is ahead of any older Weld executable on your `PATH`.
+
+Self-upgrade updates Weld itself, not installed applications. Existing apps
+remain unchanged; reinstall an unpinned package with `weld --install <package>`
+(or a local `.wld` archive) to use the new script mode even when its package
+version has not changed. `--update` / `--update-all` are for application
+packages, not for updating Weld.
 
 ### Configuration
 
@@ -57,29 +83,41 @@ Weld stores its state in `~/.weld/` and reads `~/.weld/config.toml`:
 
 ```toml
 [weld]
-compiler = "nuitka"        # "nuitka" or "pyinstaller"
+compiler = "nuitka"        # legacy name: Python scripts; or "pyinstaller"
 libs_compiler = "cython"   # only "cython" is currently supported
 default_version = "1.0.0"
 auto_pip_install = true    # install a package's deps on `weld --install`
-nuitka_opts = []           # extra options passed to Nuitka (see below)
+nuitka_opts = []           # legacy setting, saved but ignored
 ruff_opts = ["--no-cache", "--output-format=concise"]  # `ruff check` options
 ```
 
 Run `weld --doctor` at any time to check which tools are available. Tools that
 are not required for the configured compiler are reported as optional.
 
-#### Custom Nuitka / Ruff options (`-W` / `-E`)
+#### Executable script mode (legacy `nuitka` setting)
 
-Extra options for Nuitka (used by `--install`/`--update`) and Ruff (used by
-`--build`) are saved in `config.toml` and managed with four flags:
+`--install` and `--update` no longer invoke Nuitka. For each top-level `.py`
+entry in `bin/`, Weld removes only the final `.py` suffix, preserves its
+existing shebang (or adds `#!/usr/bin/env python3`), and adds execute bits
+like `chmod +x`. `main.py` becomes the package name, for example
+`~/.weld/bin/myapp`. Script contents and other permission bits are preserved;
+UTF-8 BOMs and CRLF shebangs are handled so the result runs on POSIX.
+
+These are Python scripts, **not native binaries**: Python and the application's
+dependencies must be available when they run. Keep the intended virtual
+environment active when using the default `env python3` shebang. Source
+archives and project files are not changed; preparation happens in a temporary
+directory. Existing extensionless files are not overwritten by preparation.
+Choose `compiler = "pyinstaller"` if you need native executable builds instead.
+
+#### Custom Ruff options (`-W` / `-E`)
+
+Extra options for Ruff (used by `--build`) are saved in `config.toml`:
 
 ```bash
-weld -Wnuitka "--standalone"     # add a Nuitka option (saved)
-weld -Wnuitka "--jobs=4 --quiet" # several options in one string also work
-weld -Enuitka "--standalone"     # remove it again (warns if not found)
-
-weld -Wruff "--ignore=F401"      # add a Ruff option (saved)
-weld -Eruff "--no-cache"         # even the defaults can be removed
+weld -Wruff "--ignore=F401"       # add a Ruff option (saved)
+weld -Wruff "--ignore=E501 --quiet" # several options in one string also work
+weld -Eruff "--no-cache"          # even the defaults can be removed
 ```
 
 `-W...` adds and `-E...` removes; both are repeatable and also accept the
@@ -89,6 +127,10 @@ combined with a command and then apply to that run immediately, e.g.
 `weld --build myapp -Wruff "--ignore=F401"`. Options are matched exactly,
 one flag at a time (remove `--output-format=concise`, not just
 `--output-format`). `--doctor` and `--stats` show the current lists.
+
+The legacy `-Wnuitka` / `-Enuitka` flags still save and remove `nuitka_opts`
+for compatibility with existing configurations, but those options are ignored
+and explicitly labelled as such. They do not enable native compilation.
 
 ## 🏁 Quick start
 
@@ -152,9 +194,10 @@ entry:
 
 ## 🧪 Tests
 
-The test-suite runs Weld end-to-end in an isolated `HOME` using fake
-Nuitka/PyInstaller shims, so it never touches your real `~/.weld` and does not
-need a C toolchain.
+The test-suite runs Weld end-to-end in an isolated `HOME`, executing the
+installed Python scripts directly and using a fake PyInstaller shim for
+native build tests. It never touches your real `~/.weld` and does not need
+Nuitka or a C toolchain.
 
 ```bash
 pip install -r requirements-dev.txt

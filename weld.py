@@ -16,6 +16,7 @@ import sys
 import tempfile
 import threading
 import time
+import tokenize
 import zipfile
 from collections import defaultdict
 from contextlib import contextmanager
@@ -46,7 +47,7 @@ except ImportError:
 
 console = Console()
 
-VERSION = "0.5.1"
+VERSION = "0.6.0"
 
 WELD_DIR       = os.path.expanduser("~/.weld")
 WELD_BIN       = os.path.join(WELD_DIR, "bin")
@@ -91,8 +92,8 @@ _WELD_DIR_KNOWN = {
     "plugins", "templates",
 }
 
-# Default extra options passed to the external tools.  Users manage these
-# with -Wnuitka / -Enuitka / -Wruff / -Eruff (or by editing config.toml).
+# Saved tool options, managed with -Wnuitka / -Enuitka / -Wruff / -Eruff
+# (or by editing config.toml). Legacy Nuitka options are retained but ignored.
 _DEFAULT_NUITKA_OPTS: list[str] = []
 _DEFAULT_RUFF_OPTS: list[str] = ["--no-cache", "--output-format=concise"]
 
@@ -1316,6 +1317,7 @@ def _get_tool_opts(tool: str) -> list[str]:
 
 
 def get_nuitka_opts() -> list[str]:
+    """Return legacy options for compatibility; script preparation ignores them."""
     return _get_tool_opts("nuitka")
 
 
@@ -1408,6 +1410,8 @@ def _apply_tool_opt_changes(
 
     current = shlex.join(opts) if opts else "(none)"
     _print(f"{_DIM}Current {tool} options: {current}  (config: {WELD_CONFIG}){_RESET}")
+    if tool == "nuitka":
+        _print(f"{_DIM}Legacy Nuitka options are saved for compatibility but ignored.{_RESET}")
     return True
 
 
@@ -1601,40 +1605,65 @@ def remove_changelog(pkg_name: str, silent: bool = False) -> None:
 
 def compile_py_nuitka(
     full_path: str, cwd: str,
-    line_cb = None,
+    line_cb=None,
     opts: list[str] | None = None,
 ) -> subprocess.CompletedProcess:
-    """
-    Compile *full_path* with Nuitka.
-    *full_path* must be an absolute path to the .py file.
-    If *line_cb* is provided, each stderr line (stripped) is passed to it live.
-    *opts* are the extra Nuitka options (managed with -Wnuitka / -Enuitka);
-    when omitted the saved options from the config are used.
-    """
-    if not os.path.isabs(full_path):
-        full_path = os.path.join(cwd, full_path)
-    if opts is None:
-        opts = get_nuitka_opts()
+    """Turn a .py file into an executable Python script without Nuitka.
 
-    proc = subprocess.Popen(
-        ["nuitka", *opts, full_path],
-        cwd=cwd,
-        stdout=subprocess.DEVNULL,
-        stderr=subprocess.PIPE,
-        text=True,
-    )
+    Relative paths are resolved against *cwd*. The output is next to the
+    source with only the final .py suffix removed. An existing shebang is
+    preserved; otherwise /usr/bin/env python3 is used. Execute bits are
+    added without changing the other permissions.
 
-    stderr_chunks: list[str] = []
-    for line in proc.stderr:
-        stderr_chunks.append(line)
+    The legacy name, *opts* (ignored), callback, and CompletedProcess return
+    value are retained for compatibility. The source is removed only after
+    the output has been written and chmod'ed successfully, and an existing
+    output is never overwritten.
+    """
+    full_path = os.path.abspath(os.path.join(cwd, full_path))
+    output = full_path.removesuffix(".py")
+    created_output = False
+    try:
+        if not full_path.endswith(".py"):
+            raise ValueError("File must be a .py file")
+
+        with open(full_path, "rb") as fp:
+            mode = stat.S_IMODE(os.fstat(fp.fileno()).st_mode)
+            encoding, _ = tokenize.detect_encoding(fp.readline)
+            fp.seek(0)
+            source = fp.read().removeprefix(b"\xef\xbb\xbf")
+
+        if source.startswith(b"#!"):
+            shebang, _, body = source.partition(b"\n")
+            # A CRLF shebang is not executable on POSIX; leave the body intact.
+            script = shebang.rstrip(b"\r") + b"\n" + body
+        else:
+            header = b"#!/usr/bin/env python3\n"
+            if encoding not in ("utf-8", "utf-8-sig"):
+                # A coding cookie originally on line two must stay effective
+                # after inserting the shebang (PEP 263 only checks two lines).
+                header += f"# coding: {encoding}\n".encode("ascii")
+            script = header + source
+
+        with open(output, "xb") as fp:
+            created_output = True
+            fp.write(script)
+        os.chmod(output, mode | stat.S_IXUSR | stat.S_IXGRP | stat.S_IXOTH)
+        os.remove(full_path)
+    except (OSError, ValueError, SyntaxError) as exc:
+        if created_output:
+            try:
+                os.remove(output)
+            except OSError:
+                pass
+        message = str(exc)
         if line_cb:
-            line_cb(line.rstrip("\n\r"))
+            line_cb(message)
+        return subprocess.CompletedProcess([full_path], 1, stdout="", stderr=message)
 
-    proc.wait()
-    return subprocess.CompletedProcess(
-        proc.args, proc.returncode,
-        stdout="", stderr="".join(stderr_chunks),
-    )
+    if line_cb:
+        line_cb(f"Prepared {os.path.basename(output)}")
+    return subprocess.CompletedProcess([full_path], 0, stdout="", stderr="")
 
 
 def compile_py_pyinstaller(full_path: str, cwd: str) -> subprocess.CompletedProcess:
@@ -1671,63 +1700,11 @@ def compile_py_pyinstaller(full_path: str, cwd: str) -> subprocess.CompletedProc
 def _compile_nuitka_live(
     full_path: str, cwd: str, label: str, opts: list[str] | None = None
 ) -> subprocess.CompletedProcess:
-    """Compile with Nuitka showing a live spinner + last stderr line, truncated to term width - 2.
-
-    *opts* are the extra Nuitka options (managed with -Wnuitka / -Enuitka);
-    when omitted the saved options from the config are used.
-    """
-    term_w = shutil.get_terminal_size().columns
-    max_vis = term_w - 2
-    if opts is None:
-        opts = get_nuitka_opts()
-
-    proc = subprocess.Popen(
-        ["nuitka", *opts, full_path],
-        cwd=cwd, stdout=subprocess.DEVNULL, stderr=subprocess.PIPE, text=True,
-    )
-
-    stderr_chunks: list[str] = []
-    last_output = ""
-    idx = 0
-    _write(_HIDE_CURSOR)
-
-    try:
-        for line in proc.stderr:
-            stderr_chunks.append(line)
-            stripped = line.rstrip("\n\r")
-            if stripped:
-                last_output = stripped
-
-            frame = SPINNER_FRAMES[idx % len(SPINNER_FRAMES)]
-            prefix_vis = 2 + len(label)  # frame + space + label
-            avail = max(max_vis - prefix_vis - 1, 0)
-            truncated = last_output[:avail]
-
-            out = f"\r{_CLEAR_LINE}{_CYAN}{frame}{_RESET} {label}"
-            if truncated:
-                out += f" {_DIM}{truncated}{_RESET}"
-            _write(out)
-            idx += 1
-
-        proc.wait()
-    except BaseException:
-        proc.kill()
-        try:
-            proc.wait(timeout=5)
-        except subprocess.TimeoutExpired:
-            pass
-        raise
-    finally:
-        _write(_SHOW_CURSOR)
-
-    ok = proc.returncode == 0
-    icon = f"{_GREEN}✔{_RESET}" if ok else f"{_RED}✘{_RESET}"
+    """Prepare an executable script and display its status (legacy name)."""
+    result = compile_py_nuitka(full_path, cwd, opts=opts)
+    icon = f"{_GREEN}✔{_RESET}" if result.returncode == 0 else f"{_RED}✘{_RESET}"
     _write(f"\r{_CLEAR_LINE}{icon} {label}\n")
-
-    return subprocess.CompletedProcess(
-        proc.args, proc.returncode,
-        stdout="", stderr="".join(stderr_chunks),
-    )
+    return result
 
 
 def _find_c_compiler() -> str | None:
@@ -2315,9 +2292,9 @@ def _cmd_install(wld_file: str, log_action: bool = True) -> None:
             raise SystemExit(1)
         tmp_libs = os.path.join(tmp_bin, "libs")
 
-        # Rename main.py -> <pkg>.py so compilers name the binary after the
-        # package. Everything is compiled inside the temporary directory so a
-        # failure can never leave half-installed files in ~/.weld.
+        # Rename main.py -> <pkg>.py so the executable is named after the
+        # package. Prepare scripts / compile inside the temporary directory so
+        # a failure can never leave half-installed files in ~/.weld.
         main_src = os.path.join(tmp_bin, "main.py")
         main_dst = os.path.join(tmp_bin, f"{pkg_name}.py")
         if os.path.isfile(main_src) and os.path.abspath(main_src) != os.path.abspath(main_dst):
@@ -2328,12 +2305,15 @@ def _cmd_install(wld_file: str, log_action: bool = True) -> None:
 
         if py_files:
             if compiler == "nuitka":
-                _require_tool("nuitka", "Install it with: pip install nuitka")
+                _print(f"\n{_BOLD}{_CYAN}Preparing Python executables...{_RESET}")
+                if nuitka_opts:
+                    _print(
+                        f"{_YELLOW}Warning:{_RESET} Nuitka options are ignored; "
+                        "this mode installs executable Python scripts."
+                    )
             else:
                 _require_tool("pyinstaller", "Install it with: pip install pyinstaller")
-            _print(f"\n{_BOLD}{_CYAN}Compiling with {compiler}...{_RESET}")
-            if compiler == "nuitka" and nuitka_opts:
-                _print(f"{_DIM}nuitka options: {shlex.join(nuitka_opts)}{_RESET}")
+                _print(f"\n{_BOLD}{_CYAN}Compiling with {compiler}...{_RESET}")
             try:
                 for idx, py_file in enumerate(py_files, 1):
                     full = os.path.join(tmp_bin, py_file)
@@ -2344,8 +2324,9 @@ def _cmd_install(wld_file: str, log_action: bool = True) -> None:
                         with spinner(f"{compiler}  {py_file}"):
                             result = compile_py_pyinstaller(full, tmp_bin)
                     if result.returncode != 0:
+                        operation = "Script preparation" if compiler == "nuitka" else compiler
                         console.print(
-                            f"[red]Error:[/red] {_esc(compiler)} failed for {_esc(py_file)}"
+                            f"[red]Error:[/red] {_esc(operation)} failed for {_esc(py_file)}"
                         )
                         stderr = (result.stderr or "").strip()
                         if stderr:
@@ -2354,20 +2335,14 @@ def _cmd_install(wld_file: str, log_action: bool = True) -> None:
             finally:
                 _progress_done()
 
-        # Normalise compiler output names and remove build leftovers.
-        for bin_file in filter_files(tmp_bin, ".bin"):
-            os.replace(
-                os.path.join(tmp_bin, bin_file),
-                os.path.join(tmp_bin, bin_file.removesuffix(".bin")),
-            )
-        for build_dir in filter_dirs(tmp_bin, ".build"):
-            shutil.rmtree(os.path.join(tmp_bin, build_dir), ignore_errors=True)
-
         binary_names = {os.path.splitext(py_file)[0] for py_file in py_files}
-        for py_file in py_files:
-            path = os.path.join(tmp_bin, py_file)
-            if os.path.exists(path):
-                os.remove(path)
+        if compiler == "pyinstaller":
+            # Script preparation already removes its sources. Removing them
+            # again could delete an output such as helper.py from helper.py.py.
+            for py_file in py_files:
+                path = os.path.join(tmp_bin, py_file)
+                if os.path.exists(path):
+                    os.remove(path)
         for cache in ("__pycache__", ".mypy_cache", ".ruff_cache"):
             shutil.rmtree(os.path.join(tmp_bin, cache), ignore_errors=True)
 
@@ -2435,7 +2410,7 @@ def _cmd_install(wld_file: str, log_action: bool = True) -> None:
                 shutil.rmtree(os.path.join(tmp_libs, cache), ignore_errors=True)
 
         # Everything left in bin/ (except libs/ and junk) is an installable
-        # artifact: either a compiled binary or a data file/directory.
+        # artifact: an executable script/binary or a data file/directory.
         artifacts: list[str] = []
         for entry in sorted(os.listdir(tmp_bin)):
             if entry == "libs" or _is_junk_name(entry):
@@ -2463,7 +2438,7 @@ def _cmd_install(wld_file: str, log_action: bool = True) -> None:
                     if not existed:
                         created_files.append(dst)
                     installed_files.append(entry)
-                    if entry in binary_names:
+                    if entry in binary_names and compiler == "pyinstaller":
                         os.chmod(dst, 0o755)
 
             for lib in compiled_libs:
@@ -2629,9 +2604,9 @@ def _cmd_update(wld_file: str) -> None:
             f"{old_info.get('version', '?')} -> {config['version']}"
         )
 
-    # _cmd_install() compiles everything in a temporary directory and only
-    # touches the installed files once compilation succeeded, so a failed
-    # update leaves the previous version intact and installed.
+    # _cmd_install() prepares scripts / compiles in a temporary directory and
+    # only touches installed files after that succeeds, so preparation/build
+    # failures leave the previous version intact and installed.
     _cmd_install(wld_file, log_action=False)
 
     _call_hook(global_plugin, "after_update", config)
@@ -3288,7 +3263,7 @@ def cmd_stats() -> None:
     table.add_row("Templates available", str(n_templates))
     table.add_row("Compiler",            cfg.get("compiler",      "nuitka"))
     table.add_row("Libs compiler",       cfg.get("libs_compiler", "cython"))
-    table.add_row("Nuitka options",      shlex.join(get_nuitka_opts()) or "-")
+    table.add_row("Nuitka options (ignored)", shlex.join(get_nuitka_opts()) or "-")
     table.add_row("Ruff options",        shlex.join(get_ruff_opts()) or "-")
     table.add_row("weld version",         VERSION)
     table.add_row("Python",              sys.version.split()[0])
@@ -3309,7 +3284,6 @@ def cmd_doctor() -> None:
     tools = [
         ("python",      [sys.executable,  "--version"], True),
         ("ruff",        ["ruff",          "--version"], True),
-        ("nuitka",      ["nuitka",        "--version"], compiler == "nuitka"),
         ("pyinstaller", ["pyinstaller",   "--version"], compiler == "pyinstaller"),
         ("cython",      ["cython",        "--version"], False),
         ("setuptools",  [sys.executable,  "-c", "import setuptools"], False),
@@ -3389,7 +3363,7 @@ def cmd_doctor() -> None:
             _esc(str(version)), required,
         )
     console.print(table)
-    _print(f"{_DIM}nuitka options: {shlex.join(get_nuitka_opts()) or '(none)'}{_RESET}")
+    _print(f"{_DIM}nuitka options (ignored): {shlex.join(get_nuitka_opts()) or '(none)'}{_RESET}")
     _print(f"{_DIM}ruff options:   {shlex.join(get_ruff_opts()) or '(none)'}{_RESET}")
     _print()
 
@@ -3761,8 +3735,8 @@ _weld() {{
         '--template[Apply a template to current project]:template:({template_names})'
         '--templates[List available templates]'
         '--completions[Print completions]:shell:(zsh)'
-        '-Wnuitka[Add Nuitka option(s), saved to config]:opt:'
-        '-Enuitka[Remove Nuitka option(s) from config]:opt:'
+        '-Wnuitka[Save legacy Nuitka option(s), ignored in script mode]:opt:'
+        '-Enuitka[Remove saved legacy Nuitka option(s)]:opt:'
         '-Wruff[Add Ruff option(s), saved to config]:opt:'
         '-Eruff[Remove Ruff option(s) from config]:opt:'
         '--version[Show version]'
@@ -4654,9 +4628,10 @@ def main() -> None:
             "up in the Weld_tools registry (https://github.com/MrNotInk/Weld_tools) "
             "and downloaded from the link in list.json; local paths like "
             "./clock find clock.wld in the current directory.\n"
-            "Tool options: -Wnuitka/-Wruff add and -Enuitka/-Eruff remove saved "
-            "Nuitka/Ruff options in ~/.weld/config.toml; they can be used alone "
-            "or combined with --build/--install/--update and apply immediately."
+            "Tool options: -Wruff adds and -Eruff removes saved Ruff options "
+            "in ~/.weld/config.toml; they apply to --build immediately. "
+            "Legacy -Wnuitka/-Enuitka options are saved but ignored: the "
+            "nuitka mode now installs executable Python scripts without compiling."
         ),
     )
 
@@ -4699,9 +4674,9 @@ def main() -> None:
     parser.add_argument("--yes",          action="store_true", help="Auto-confirm prompts (for --self-upgrade)")
     parser.add_argument("--force",        action="store_true", help="Force reinstall even if already on latest (for --self-upgrade)")
     parser.add_argument("-Wnuitka", dest="wnuitka", metavar="<opt>", action="append", default=[],
-                        help='Add Nuitka option(s), e.g. -Wnuitka "--standalone" (repeatable; saved to config)')
+                        help="Save legacy Nuitka option(s) for compatibility (ignored in script mode)")
     parser.add_argument("-Enuitka", dest="enuitka", metavar="<opt>", action="append", default=[],
-                        help="Remove saved Nuitka option(s) (warns if an option is not found)")
+                        help="Remove saved legacy Nuitka option(s) (ignored in script mode)")
     parser.add_argument("-Wruff",   dest="wruff",   metavar="<opt>", action="append", default=[],
                         help='Add Ruff option(s), e.g. -Wruff "--ignore=F401" (repeatable; saved to config)')
     parser.add_argument("-Eruff",   dest="eruff",   metavar="<opt>", action="append", default=[],

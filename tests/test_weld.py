@@ -1,8 +1,8 @@
 """End-to-end tests for weld.py.
 
 Every test runs weld in an isolated HOME so the real ~/.weld is never touched.
-Fake ``nuitka``/``pyinstaller`` shims are placed on PATH; they only produce a
-tiny shell script instead of a real binary.
+The default backend installs real executable Python scripts. A fake
+``pyinstaller`` shim produces a tiny shell script for native build tests.
 """
 
 from __future__ import annotations
@@ -25,21 +25,6 @@ TEMPLATE_NAMES = [
     "bot", "cron", "tcp_server", "grpc", "data_pipeline", "rest_client",
     "config_app", "plugin",
 ]
-
-_FAKE_NUITKA = """#!/usr/bin/env python3
-import os, sys
-
-if "--version" in sys.argv:
-    print("fake-nuitka 1.0")
-    sys.exit(0)
-
-src = sys.argv[-1]
-stem = os.path.splitext(os.path.basename(src))[0]
-out = os.path.join(os.path.dirname(os.path.abspath(src)), stem + ".bin")
-with open(out, "w") as f:
-    f.write('#!/bin/sh\\necho compiled-' + stem + ' "$@"\\n')
-os.chmod(out, 0o755)
-"""
 
 _FAKE_PYINSTALLER = """#!/usr/bin/env python3
 import os, sys
@@ -75,30 +60,6 @@ _FAILING_COMPILER = """#!/bin/sh
 echo "compiler exploded" >&2
 exit 1
 """
-
-# Like _FAKE_NUITKA, but appends its argv (one JSON list per line) to the
-# file named by $WELD_NUITKA_ARGS so tests can assert which options weld
-# passed to the compiler.
-_RECORDING_NUITKA = """#!/usr/bin/env python3
-import json, os, sys
-
-if "--version" in sys.argv:
-    print("fake-nuitka 1.0")
-    sys.exit(0)
-
-record = os.environ.get("WELD_NUITKA_ARGS")
-if record:
-    with open(record, "a") as f:
-        f.write(json.dumps(sys.argv[1:]) + "\\n")
-
-src = sys.argv[-1]
-stem = os.path.splitext(os.path.basename(src))[0]
-out = os.path.join(os.path.dirname(os.path.abspath(src)), stem + ".bin")
-with open(out, "w") as f:
-    f.write('#!/bin/sh\\necho compiled-' + stem + ' "$@"\\n')
-os.chmod(out, 0o755)
-"""
-
 
 def _write_exe(path: Path, content: str) -> None:
     path.write_text(content, encoding="utf-8")
@@ -225,10 +186,8 @@ def _make_runner(
     home.mkdir()
     fakebin = tmp_path / f"fakebin{suffix}"
     fakebin.mkdir()
-    _write_exe(fakebin / "nuitka", _FAKE_NUITKA)
     _write_exe(fakebin / "pyinstaller", _FAKE_PYINSTALLER)
     if failing_compiler:
-        _write_exe(fakebin / "nuitka", _FAILING_COMPILER)
         _write_exe(fakebin / "pyinstaller", _FAILING_COMPILER)
 
     tmpdir = tmp_path / f"tmp{suffix}"
@@ -244,7 +203,7 @@ def _make_runner(
     return WeldRunner(tmp_path, home, env)
 
 
-def make_archive(path: Path, config: dict, files: dict[str, str] | None = None) -> Path:
+def make_archive(path: Path, config: dict, files: dict[str, str | bytes] | None = None) -> Path:
     with zipfile.ZipFile(path, "w") as zf:
         zf.writestr("config.json", json.dumps(config))
         for name, content in (files or {}).items():
@@ -447,20 +406,88 @@ def test_plugin_hooks_run(weld: WeldRunner) -> None:
 # ---------------------------------------------------------------------------
 
 def test_install_and_run(weld: WeldRunner) -> None:
-    weld.new("app")
+    project = weld.new("app")
+    source = "import sys\n\nprint('script-app', *sys.argv[1:])\n"
+    (project / "bin" / "main.py").write_text(source, encoding="utf-8")
+    (project / "bin" / "main.py").chmod(0o640)
     archive = weld.build("app")
     result = weld.install(archive)
     assert "Installed" in result.stdout
+    assert "Preparing Python executables" in result.stdout
 
     info = weld.packages()["app"]
     assert info["files"] == ["app"]
     assert info["version"] == "1.0.0"
-    assert os.access(weld.bin_dir / "app", os.X_OK)
+    executable = weld.bin_dir / "app"
+    assert os.access(executable, os.X_OK)
+    assert executable.stat().st_mode & 0o777 == 0o751
+    assert executable.read_bytes() == b"#!/usr/bin/env python3\n" + source.encode()
+    assert not (weld.bin_dir / "app.py").exists()
+    assert not (weld.bin_dir / "app.bin").exists()
+    assert (project / "bin" / "main.py").read_text(encoding="utf-8") == source
+    with zipfile.ZipFile(archive) as zf:
+        assert zf.read("bin/main.py") == source.encode()
 
-    run = weld.ok("--run", "app", "--flag", "value")
-    assert "compiled-app --flag value" in run.stdout
+    run = weld.ok("--run", "app", "--flag", "value with spaces")
+    assert run.stdout.strip() == "script-app --flag value with spaces"
 
     assert (weld.home / ".weld" / "Readme" / "app-Readme").is_file()
+
+
+@pytest.mark.parametrize("name", ["helper", "helper.tool", "helper.bin", "helper.py"])
+def test_install_removes_only_final_py_suffix(weld: WeldRunner, name: str) -> None:
+    source = "import sys\nprint('helper', *sys.argv[1:])\n"
+    archive = make_archive(
+        weld.root / "app.wld",
+        {"name": "app", "version": "1.0.0", "deps": [], "desc": ""},
+        {"bin/main.py": "print('main')\n", f"bin/{name}.py": source},
+    )
+    # No Nuitka, PyInstaller, or native compiler is available on this PATH.
+    weld.install(archive, path=str(VENV_BIN))
+    executable = weld.bin_dir / name
+    assert executable.read_bytes() == b"#!/usr/bin/env python3\n" + source.encode()
+    assert os.access(executable, os.X_OK)
+    assert not (weld.bin_dir / f"{name}.py").exists()
+    assert weld.packages()["app"]["files"] == sorted(["app", name])
+    result = subprocess.run(
+        [str(executable), "some argument"], env=weld.env,
+        capture_output=True, text=True, check=True, timeout=10,
+    )
+    assert result.stdout.strip() == "helper some argument"
+
+
+def test_install_preserves_outputs_that_match_old_source_names(weld: WeldRunner) -> None:
+    archive = make_archive(
+        weld.root / "app.wld",
+        {"name": "app", "version": "1.0.0", "deps": [], "desc": ""},
+        {
+            "bin/main.py": "print('main')\n",
+            "bin/helper.py": "print('first helper')\n",
+            "bin/helper.py.py": "print('second helper')\n",
+        },
+    )
+    weld.install(archive)
+    assert weld.packages()["app"]["files"] == ["app", "helper", "helper.py"]
+    for name, expected in [("helper", "first helper"), ("helper.py", "second helper")]:
+        result = subprocess.run(
+            [str(weld.bin_dir / name)], env=weld.env,
+            capture_output=True, text=True, check=True, timeout=10,
+        )
+        assert result.stdout.strip() == expected
+    assert not (weld.bin_dir / "helper.py.py").exists()
+
+
+def test_run_forwards_script_arguments_and_exit_status(weld: WeldRunner) -> None:
+    archive = make_archive(
+        weld.root / "app.wld",
+        {"name": "app", "version": "1.0.0", "deps": [], "desc": ""},
+        {"bin/main.py": "import json, sys\nprint(json.dumps(sys.argv[1:]))\nsys.exit(7)\n"},
+    )
+    weld.install(archive)
+    args = ["--version", "two words", "", "--flag=value"]
+    result = weld.fail("--run", "app", *args)
+    assert result.returncode == 7
+    assert json.loads(result.stdout) == args
 
 
 def test_install_uses_pyinstaller_when_configured(weld: WeldRunner) -> None:
@@ -526,16 +553,20 @@ def test_install_rejects_invalid_archive(weld: WeldRunner) -> None:
     assert "not a valid" in weld.fail("--install", str(bad)).stdout
 
 
-def test_install_failure_leaves_no_files(weld: WeldRunner) -> None:
-    failbin = weld.root / "failbin"
-    failbin.mkdir()
-    _write_exe(failbin / "nuitka", _FAILING_COMPILER)
-    weld.new("app")
+@pytest.mark.parametrize("compiler", ["nuitka", "pyinstaller"])
+def test_install_failure_leaves_no_files(weld: WeldRunner, compiler: str) -> None:
+    project = weld.new("app")
+    weld.set_config(compiler=compiler)
+    if compiler == "nuitka":
+        # Script preparation must not overwrite an existing extensionless file.
+        (project / "bin" / "app").write_text("package data", encoding="utf-8")
+        expected_error = "File exists"
+    else:
+        _write_exe(weld.root / "fakebin" / "pyinstaller", _FAILING_COMPILER)
+        expected_error = "compiler exploded"
     archive = weld.build("app")
-    result = weld.fail(
-        "--install", str(archive), path=f"{failbin}:{weld.env['PATH']}"
-    )
-    assert "compiler exploded" in result.stdout
+    result = weld.fail("--install", str(archive))
+    assert expected_error in result.stdout
     assert weld.packages() == {}
     assert list(weld.bin_dir.iterdir()) == [weld.libs_dir]
 
@@ -585,14 +616,18 @@ def test_install_package_data_directories(weld: WeldRunner) -> None:
     assets = project / "bin" / "assets" / "sub"
     assets.mkdir(parents=True)
     (assets / "f.txt").write_text("hello", encoding="utf-8")
+    (project / "bin" / "payload.bin").write_bytes(b"binary data")
     archive = weld.build("dataapp")
     weld.install(archive)
 
     assert (weld.bin_dir / "assets" / "sub" / "f.txt").read_text(
         encoding="utf-8"
     ) == "hello"
+    assert (weld.bin_dir / "payload.bin").read_bytes() == b"binary data"
+    assert not (weld.bin_dir / "payload").exists()
     info = weld.packages()["dataapp"]
     assert "assets/sub/f.txt" in info["files"]
+    assert "payload.bin" in info["files"]
     weld.ok("--verify")
 
     weld.ok("--remove", "dataapp")
@@ -623,25 +658,36 @@ def test_update_changes_version(weld: WeldRunner) -> None:
     assert "Updating" in result.stdout
     assert weld.packages()["app"]["version"] == "2.0.0"
     assert weld.packages()["app"]["files"] == ["app"]
-    assert "compiled-app" in weld.ok("--run", "app").stdout
+    assert "Hello, world!" in weld.ok("--run", "app").stdout
 
 
-def test_failed_update_keeps_previous_version(weld: WeldRunner) -> None:
-    weld.new("app")
+@pytest.mark.parametrize("compiler", ["nuitka", "pyinstaller"])
+def test_failed_update_keeps_previous_version(weld: WeldRunner, compiler: str) -> None:
+    project = weld.new("app")
+    weld.set_config(compiler=compiler)
     archive = weld.build("app")
     weld.install(archive)
+    previous_executable = (weld.bin_dir / "app").read_bytes()
 
-    failbin = weld.root / "failbin"
-    failbin.mkdir()
-    _write_exe(failbin / "nuitka", _FAILING_COMPILER)
-    result = weld.fail(
-        "--update", str(archive),
-        path=f"{failbin}:{weld.env['PATH']}",
-    )
-    assert "compiler exploded" in result.stdout
+    config_path = project / "config.json"
+    config = json.loads(config_path.read_text(encoding="utf-8"))
+    config["version"] = "2.0.0"
+    config_path.write_text(json.dumps(config), encoding="utf-8")
+    if compiler == "nuitka":
+        (project / "bin" / "app").write_text("package data", encoding="utf-8")
+        expected_error = "File exists"
+        expected_output = "Hello, world!"
+    else:
+        _write_exe(weld.root / "fakebin" / "pyinstaller", _FAILING_COMPILER)
+        expected_error = "compiler exploded"
+        expected_output = "pyi-app"
+    archive = weld.build("app")
+    result = weld.fail("--update", str(archive))
+    assert expected_error in result.stdout
 
     assert weld.packages()["app"]["version"] == "1.0.0"
-    assert "compiled-app" in weld.ok("--run", "app").stdout
+    assert (weld.bin_dir / "app").read_bytes() == previous_executable
+    assert expected_output in weld.ok("--run", "app").stdout
 
 
 def test_update_installs_if_not_present(weld: WeldRunner) -> None:
@@ -679,13 +725,13 @@ def test_duplicate_and_rename(weld: WeldRunner) -> None:
 
     weld.ok("--duplicate", "app", "app2")
     assert (weld.bin_dir / "app2").is_file()
-    assert "compiled-app" in weld.ok("--run", "app2").stdout
+    assert "Hello, world!" in weld.ok("--run", "app2").stdout
 
     weld.ok("--rename", "app2", "app3")
     assert not (weld.bin_dir / "app2").exists()
     assert (weld.bin_dir / "app3").is_file()
     assert "app3" in weld.packages()
-    assert "compiled-app" in weld.ok("--run", "app3").stdout
+    assert "Hello, world!" in weld.ok("--run", "app3").stdout
     weld.ok("--verify")
 
 
@@ -960,46 +1006,38 @@ def test_tool_opts_from_config_file_are_used(weld: WeldRunner) -> None:
     weld.build("app")
 
 
-def test_wnuitka_options_reach_compiler_and_enuitka_removes_them(
+def test_legacy_nuitka_options_are_saved_but_never_invoke_nuitka(
     weld: WeldRunner,
 ) -> None:
     weld.new("app")
     archive = weld.build("app")
 
-    recbin = weld.root / "recbin"
-    recbin.mkdir()
-    _write_exe(recbin / "nuitka", _RECORDING_NUITKA)
-    record = weld.root / "nuitka-args.log"
-    run_kwargs = {
-        "path": f"{recbin}:{weld.env['PATH']}",
-        "extra_env": {"WELD_NUITKA_ARGS": str(record)},
-    }
+    record = weld.root / "nuitka-called"
+    _write_exe(
+        weld.root / "fakebin" / "nuitka",
+        "#!/usr/bin/env python3\n"
+        "from pathlib import Path\n"
+        f"Path({str(record)!r}).write_text('unexpected Nuitka call')\n"
+        "raise SystemExit(99)\n",
+    )
 
-    def recorded_calls() -> list[list[str]]:
-        return [
-            json.loads(line)
-            for line in record.read_text(encoding="utf-8").splitlines()
-            if line.strip()
-        ]
-
-    # One quoted string holding two options is split into two saved options.
-    weld.ok("-Wnuitka", "--weld-test-opt=abc --jobs=4")
+    # Old options remain manageable, but cannot change script preparation.
+    result = weld.ok("-Wnuitka", "--weld-test-opt=abc --jobs=4")
+    assert "ignored" in result.stdout
     assert "--weld-test-opt=abc" in _config_text(weld)
     assert "--jobs=4" in _config_text(weld)
 
-    weld.install(archive, **run_kwargs)
-    calls = recorded_calls()
-    assert calls, "fake nuitka was never invoked"
-    assert "--weld-test-opt=abc" in calls[-1]
-    assert "--jobs=4" in calls[-1]
-    assert calls[-1][-1].endswith("app.py")  # options go before the source
+    result = weld.install(archive)
+    assert "Nuitka options are ignored" in result.stdout
+    assert not record.exists()
+    assert "Hello, world!" in weld.ok("--run", "app").stdout
 
     weld.ok("-Enuitka", "--jobs=4")
-    record.write_text("", encoding="utf-8")
-    weld.install(archive, **run_kwargs)
-    calls = recorded_calls()
-    assert calls and "--jobs=4" not in calls[-1]
-    assert "--weld-test-opt=abc" in calls[-1]
+    assert "--jobs=4" not in _config_text(weld)
+    assert "--weld-test-opt=abc" in _config_text(weld)
+    weld.install(archive)
+    weld.ok("--doctor")
+    assert not record.exists()
 
 
 # ---------------------------------------------------------------------------
@@ -1095,7 +1133,7 @@ def test_update_registry_downloads_newer_version(weld: WeldRunner) -> None:
     result = weld.ok("--update", "clock", extra_env=env)
     assert "Updating" in result.stdout
     assert weld.packages()["clock"]["version"] == "1.1.2"
-    assert "compiled-clock" in weld.ok("--run", "clock").stdout
+    assert "hi" in weld.ok("--run", "clock").stdout
 
 
 def test_update_all_updates_installed_packages(weld: WeldRunner) -> None:
@@ -1169,8 +1207,8 @@ def test_install_libs_missing_c_compiler(weld: WeldRunner) -> None:
         {"name": "clock", "version": "1.0.0", "deps": [], "desc": "clock"},
         {"bin/main.py": "print('hi')\n", "bin/libs/helper.py": "x = 1\n"},
     )
-    # PATH without /usr/bin: no C compiler is visible. The venv bin is
-    # kept so the fake nuitka shim (#!/usr/bin/env python3) can run.
+    # PATH without /usr/bin: no C compiler is visible. Script preparation
+    # itself does not need Nuitka or a native toolchain.
     result = weld.fail(
         "--install", str(archive),
         path=f"{weld.root / 'fakebin'}:{VENV_BIN}",
