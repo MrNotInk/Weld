@@ -7,6 +7,23 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 
 ---
 
+## [0.6.1] - 2026-11-22
+
+### Fixed
+
+- Executable Python scripts with Cython libraries now start with `-X gil=1`
+  when installed using a free-threaded Python build. This prevents the runtime warning about
+  enabling the GIL to load modules such as `libs._clock`, without disabling
+  the GIL or incorrectly claiming arbitrary Cython code is thread-safe.
+  Interpreter paths, other options, source encodings, and script bodies
+  are preserved. Pure-Python apps and regular GIL builds are unchanged, and
+  unrelated runtime warnings are not suppressed.
+- Both version values are now `0.6.1` so the fix can be detected by the
+  self-updater once merged. Reinstall existing affected applications after
+  updating Weld to regenerate their executable shebangs.
+
+---
+
 ## [0.6.0] - 2026-11-22
 
 ### Changed

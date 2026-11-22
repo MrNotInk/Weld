@@ -67,8 +67,9 @@ Weld from a source checkout rather than a `weld` command, use
 `python weld.py --self-upgrade` instead.
 
 The updater clones `main`, reads the repository's `version` file, and installs
-`weld.py` as `~/.local/bin/weld`. Updating both version values makes `0.6.0`
-detectable as soon as it is merged; no separate release download is needed.
+`weld.py` as `~/.local/bin/weld`. Each release updates both version values,
+so new versions are detectable once merged; no separate release download is
+needed.
 Make sure `~/.local/bin` is ahead of any older Weld executable on your `PATH`.
 
 Self-upgrade updates Weld itself, not installed applications. Existing apps
@@ -109,6 +110,34 @@ environment active when using the default `env python3` shebang. Source
 archives and project files are not changed; preparation happens in a temporary
 directory. Existing extensionless files are not overwritten by preparation.
 Choose `compiler = "pyinstaller"` if you need native executable builds instead.
+
+#### Free-threaded Python and Cython libraries
+
+When Weld runs on a free-threaded CPython build and an application ships
+`bin/libs/*.py`, its executable scripts start Python with `-X gil=1`. The GIL
+is enabled before Cython extensions are imported, avoiding the warning about
+modules such as `libs._clock` enabling it automatically. This does **not**
+declare arbitrary extensions safe to run without the GIL or suppress other
+runtime warnings. Pure-Python apps and normal GIL builds keep their existing
+startup behavior.
+
+These shebangs use `env -S` (available on modern Linux and macOS) to preserve
+the interpreter command and options. After updating Weld, reinstall an affected
+application to regenerate its executable, even if its package version is unchanged:
+
+```bash
+weld --install clock
+```
+
+For an existing installation before applying the fix, safely enable the GIL
+for one invocation instead:
+
+```bash
+PYTHON_GIL=1 clock
+```
+
+Do not use `PYTHON_GIL=0` merely to silence the warning: that removes the
+extension's GIL protection rather than addressing compatibility.
 
 #### Custom Ruff options (`-W` / `-E`)
 

@@ -2,7 +2,6 @@
 
 from __future__ import annotations
 
-import importlib.util
 import os
 import stat
 import subprocess
@@ -11,16 +10,6 @@ from pathlib import Path
 from types import ModuleType
 
 import pytest
-
-
-@pytest.fixture
-def weld_module() -> ModuleType:
-    path = Path(__file__).resolve().parents[1] / "weld.py"
-    spec = importlib.util.spec_from_file_location("weld_under_test", path)
-    assert spec is not None and spec.loader is not None
-    module = importlib.util.module_from_spec(spec)
-    spec.loader.exec_module(module)
-    return module
 
 
 @pytest.mark.parametrize(
@@ -209,18 +198,22 @@ def test_invalid_input_fails_cleanly(
 
 
 @pytest.mark.parametrize("returncode", [0, 1])
+@pytest.mark.parametrize("enable_gil", [False, True])
 def test_display_wrapper_delegates_to_script_preparation(
     weld_module: ModuleType, monkeypatch: pytest.MonkeyPatch,
-    capsys: pytest.CaptureFixture[str], returncode: int,
+    capsys: pytest.CaptureFixture[str], returncode: int, enable_gil: bool,
 ) -> None:
     expected = subprocess.CompletedProcess(["app.py"], returncode, stdout="", stderr="")
     calls = []
 
-    def prepare(full_path, cwd, *, opts):
-        calls.append((full_path, cwd, opts))
+    def prepare(full_path, cwd, *, opts, enable_gil):
+        calls.append((full_path, cwd, opts, enable_gil))
         return expected
 
     monkeypatch.setattr(weld_module, "compile_py_nuitka", prepare)
-    assert weld_module._compile_nuitka_live("app.py", ".", "app.py", opts=[]) is expected
-    assert calls == [("app.py", ".", [])]
+    result = weld_module._compile_nuitka_live(
+        "app.py", ".", "app.py", opts=[], enable_gil=enable_gil,
+    )
+    assert result is expected
+    assert calls == [("app.py", ".", [], enable_gil)]
     assert ("✔" if returncode == 0 else "✘") in capsys.readouterr().out
