@@ -1428,3 +1428,325 @@ def test_legacy_cython_install_is_removed_by_remove_and_clean(
     weld.ok("--remove", "clock")
     assert not legacy.exists()
     assert keep.is_file()
+
+
+# ---------------------------------------------------------------------------
+# config.json options: entry, aliases, env, auto_pip_install, requirements
+# ---------------------------------------------------------------------------
+
+def _make_config_archive(root: Path, config: dict, files: dict) -> Path:
+    base = {"name": "clock", "version": "1.1.1", "deps": [], "desc": "clock"}
+    base.update(config)
+    return make_archive(root / "clock.wld", base, files)
+
+
+def test_config_entry_selects_the_entry_script(weld: WeldRunner) -> None:
+    archive = _make_config_archive(
+        weld.root,
+        {"entry": "cli.py"},
+        {"bin/cli.py": "print('from cli')\n", "bin/helper.py": "print('helper')\n"},
+    )
+    result = weld.install(archive)
+    assert "cli.py" in result.stdout
+    assert not (weld.bin_dir / "cli").exists()
+    assert weld.ok("--run", "clock").stdout.strip() == "from cli"
+    assert (weld.bin_dir / "helper").is_file()
+    info = weld.packages()["clock"]
+    assert info["entry"] == "cli.py"
+    assert info["files"] == ["clock", "helper"]
+    assert "bin/cli.py" in weld.ok("--info", "clock").stdout
+
+
+@pytest.mark.parametrize(
+    "entry", ["../cli.py", "nodir/cli.py", "missing.py", ["cli.py"], 3],
+)
+def test_config_entry_must_be_an_existing_file_in_bin(
+    weld: WeldRunner, entry: object,
+) -> None:
+    archive = _make_config_archive(
+        weld.root, {"entry": entry}, {"bin/cli.py": "print('cli')\n"},
+    )
+    result = weld.fail("--install", str(archive))
+    assert "entry" in result.stdout
+    assert weld.packages() == {}
+    assert not (weld.bin_dir / "clock").exists()
+
+
+def test_config_entry_is_used_by_build_and_template(weld: WeldRunner) -> None:
+    project = weld.new("app")
+    (project / "bin" / "cli.py").write_text("print('cli entry')\n", encoding="utf-8")
+    (project / "bin" / "main.py").unlink()
+    config = json.loads((project / "config.json").read_text(encoding="utf-8"))
+    config["entry"] = "cli.py"
+    (project / "config.json").write_text(json.dumps(config), encoding="utf-8")
+
+    result = weld.template(project, "hello")
+    assert "cli.py" in result.stdout
+    assert "Hello, world!" in (project / "bin" / "cli.py").read_text(encoding="utf-8")
+    assert not (project / "bin" / "main.py").exists()
+
+    archive = weld.build("app")
+    with zipfile.ZipFile(archive) as zf:
+        assert "bin/cli.py" in zf.namelist()
+    weld.install(archive)
+    assert "Hello, world!" in weld.ok("--run", "app").stdout
+
+
+def test_config_aliases_create_working_launchers(weld: WeldRunner) -> None:
+    archive = _make_config_archive(
+        weld.root,
+        {"aliases": ["clk", "time-now", "clock"]},
+        {"bin/main.py": "import json, sys\nprint(json.dumps(sys.argv[1:]))\n"},
+    )
+    result = weld.install(archive)
+    assert "clk" in result.stdout
+
+    info = weld.packages()["clock"]
+    assert info["aliases"] == ["clk", "time-now"]  # own name dropped, no dupes
+    assert sorted(info["files"]) == ["clk", "clock", "time-now"]
+    assert "clk" in weld.ok("--info", "clock").stdout
+
+    for command in ("clock", "clk", "time-now"):
+        path = weld.bin_dir / command
+        assert os.access(path, os.X_OK)
+    for command, args in (("clk", ["--flag", "two words"]), ("time-now", [])):
+        result = subprocess.run(
+            [str(weld.bin_dir / command), *args], env=weld.env,
+            capture_output=True, text=True, check=True, timeout=10,
+        )
+        assert json.loads(result.stdout) == args
+    # The shebang/body of the real command is not modified by alias shims.
+    assert (weld.bin_dir / "clock").read_bytes().startswith(b"#!/usr/bin/env python3\n")
+
+    weld.ok("--remove", "clock")
+    for command in ("clock", "clk", "time-now"):
+        assert not (weld.bin_dir / command).exists()
+
+
+def test_config_aliases_never_overwrite_other_files(weld: WeldRunner) -> None:
+    other = make_archive(
+        weld.root / "other.wld",
+        {"name": "other", "version": "1.0.0", "deps": [], "desc": ""},
+        {"bin/main.py": "print('other')\n"},
+    )
+    weld.install(other)
+
+    clash = _make_config_archive(
+        weld.root, {"aliases": ["other"]}, {"bin/main.py": "print('clock')\n"},
+    )
+    result = weld.fail("--install", str(clash))
+    assert "another installed package" in result.stdout
+    assert weld.ok("--run", "other").stdout.strip() == "other"
+    assert "clock" not in weld.packages()
+
+
+@pytest.mark.parametrize(
+    "aliases", [["bad/alias"], ["libs"], "clk", [1], [""]],
+)
+def test_invalid_aliases_are_rejected(weld: WeldRunner, aliases: object) -> None:
+    archive = _make_config_archive(
+        weld.root, {"aliases": aliases}, {"bin/main.py": "print('clock')\n"},
+    )
+    result = weld.fail("--install", str(archive))
+    assert "alias" in result.stdout.lower()
+    assert weld.packages() == {}
+
+
+def test_config_env_is_applied_only_to_the_entry_launcher(weld: WeldRunner) -> None:
+    probe = (
+        "import json, os\n"
+        "print(json.dumps({k: os.environ.get(k) for k in "
+        "('CLOCK_MODE', 'CLOCK_MSG')}))\n"
+    )
+    archive = _make_config_archive(
+        weld.root,
+        {"env": {"CLOCK_MODE": "fast", "CLOCK_MSG": "a b:c/../d"}},
+        {"bin/main.py": probe, "bin/helper.py": probe},
+    )
+    weld.install(archive)
+
+    env = dict(weld.env)
+    env.pop("CLOCK_MODE", None)
+    run = subprocess.run(
+        [str(weld.bin_dir / "clock")], env=env,
+        capture_output=True, text=True, check=True, timeout=10,
+    )
+    assert json.loads(run.stdout) == {"CLOCK_MODE": "fast", "CLOCK_MSG": "a b:c/../d"}
+    shebang = (weld.bin_dir / "clock").read_bytes().split(b"\n", 1)[0]
+    assert shebang == b"#!/usr/bin/env -S CLOCK_MODE='fast' CLOCK_MSG='a b:c/../d' python3"
+
+    # Helper scripts, and anything else run by the user, are unaffected.
+    helper = subprocess.run(
+        [str(weld.bin_dir / "helper")], env=env,
+        capture_output=True, text=True, check=True, timeout=10,
+    )
+    assert json.loads(helper.stdout) == {"CLOCK_MODE": None, "CLOCK_MSG": None}
+    assert "CLOCK_MODE" not in os.environ
+
+
+@pytest.mark.parametrize(
+    "env_value",
+    [{"A": "x"}, {"1BAD": "x"}, {"A": "line\nbreak"}, {"A": "quote's"}, {}],
+)
+def test_config_env_validation(weld: WeldRunner, env_value: dict) -> None:
+    archive = _make_config_archive(
+        weld.root, {"env": env_value}, {"bin/main.py": "print('clock')\n"},
+    )
+    if env_value == {"A": "x"} or env_value == {}:
+        result = weld.install(archive)
+        assert "Installed" in result.stdout
+        stored = weld.packages()["clock"]["env"]
+        assert stored == env_value
+    else:
+        result = weld.fail("--install", str(archive))
+        assert "env" in result.stdout
+        assert weld.packages() == {}
+
+
+def test_config_env_combines_with_gil_shebang(weld: WeldRunner) -> None:
+    archive = _make_config_archive(
+        weld.root,
+        {"env": {"CLOCK_MODE": "fast"}},
+        {"bin/main.py": "print('clock')\n", "bin/libs/_clock.py": "VALUE = 1\n"},
+    )
+    # Free-threaded detection is exercised in test_gil_compatibility; here the
+    # ordering of env assignments before the interpreter is what matters.
+    weld.install(archive)
+    shebang = (weld.bin_dir / "clock").read_bytes().split(b"\n", 1)[0]
+    assert shebang.startswith(b"#!/usr/bin/env -S CLOCK_MODE='fast' python3")
+    assert b"CLOCK_MODE" in shebang
+
+
+def test_config_auto_pip_install_overrides_the_global_setting(weld: WeldRunner) -> None:
+    archive = _make_config_archive(
+        weld.root,
+        {"deps": ["rich"], "auto_pip_install": False},
+        {"bin/main.py": "print('clock')\n"},
+    )
+    result = weld.install(archive)
+    assert "Skipping installation" in result.stdout
+    assert "Installing dependencies" not in result.stdout
+    assert weld.packages()["clock"]["deps"] == ["rich"]
+
+    explicit = _make_config_archive(
+        weld.root, {"deps": ["rich"], "auto_pip_install": True},
+        {"bin/main.py": "print('clock2')\n"},
+    )
+    # Global setting disabled: the package explicitly opts back in (pip is
+    # pointed at no index, so only the already-installed "rich" resolves).
+    weld.set_config(auto_pip_install=False)
+    result = weld.install(explicit, extra_env={"PIP_NO_INDEX": "1"})
+    assert "Installing dependencies" in result.stdout
+    assert "Installed" in result.stdout
+
+
+def test_min_weld_version_blocks_installation_before_any_change(weld: WeldRunner) -> None:
+    archive = _make_config_archive(
+        weld.root, {"min_weld_version": "99.0.0"}, {"bin/main.py": "print('clock')\n"},
+    )
+    result = weld.fail("--install", str(archive))
+    assert "needs Weld 99.0.0" in result.stdout
+    assert "--self-upgrade" in result.stdout
+    assert weld.packages() == {}
+    assert not (weld.bin_dir / "clock").exists()
+
+    ok_archive = _make_config_archive(
+        weld.root, {"min_weld_version": "0.0.1"}, {"bin/main.py": "print('clock')\n"},
+    )
+    assert "Installed" in weld.install(ok_archive).stdout
+    assert weld.packages()["clock"]["min_weld_version"] == "0.0.1"
+
+
+def test_python_requires_blocks_incompatible_interpreters(weld: WeldRunner) -> None:
+    current = f"{sys.version_info.major}.{sys.version_info.minor}"
+    blocked = _make_config_archive(
+        weld.root, {"python_requires": f">={sys.version_info.major + 1}"},
+        {"bin/main.py": "print('clock')\n"},
+    )
+    result = weld.fail("--install", str(blocked))
+    assert "needs Python >=" in result.stdout
+    assert sys.version.split()[0] in result.stdout
+    assert weld.packages() == {}
+
+    allowed = _make_config_archive(
+        weld.root, {"python_requires": f">={current},<{sys.version_info.major + 1}"},
+        {"bin/main.py": "print('clock')\n"},
+    )
+    assert "Installed" in weld.install(allowed).stdout
+
+
+@pytest.mark.parametrize(
+    ("spec", "expected"),
+    [
+        (">=3.0,<4", True),
+        ("<3.0", False),
+        ("==3.*", True),
+        ("!=3.0.*", True),
+        ("!=3.11.*", False),
+        ("~=3.0", True),
+        ("banana", None),
+    ],
+)
+def test_python_requires_specifier_evaluation(
+    weld: WeldRunner, spec: str, expected: bool | None,
+) -> None:
+    archive = _make_config_archive(
+        weld.root, {"python_requires": spec}, {"bin/main.py": "print('clock')\n"},
+    )
+    result = weld.run("--install", str(archive))
+    if expected is None:
+        assert result.returncode != 0
+        assert "invalid python_requires" in result.stdout
+    elif expected:
+        assert result.returncode == 0, result.stdout
+    else:
+        assert result.returncode != 0
+        assert "needs Python" in result.stdout
+
+
+def test_requires_tools_are_checked_before_installing(weld: WeldRunner) -> None:
+    archive = _make_config_archive(
+        weld.root,
+        {"requires": ["git", "definitely-not-a-real-tool-xyz"]},
+        {"bin/main.py": "print('clock')\n"},
+    )
+    result = weld.fail("--install", str(archive))
+    assert "needs definitely-not-a-real-tool-xyz" in result.stdout
+    assert "found" in result.stdout and "git" in result.stdout
+    assert "missing" in result.stdout
+    assert "was not installed" in result.stdout
+    assert weld.packages() == {}
+    assert not (weld.bin_dir / "clock").exists()
+
+    present = _make_config_archive(
+        weld.root, {"requires": ["git"]}, {"bin/main.py": "print('clock')\n"},
+    )
+    assert "Installed" in weld.install(present).stdout
+    assert weld.packages()["clock"]["requires"] == ["git"]
+
+
+def test_doctor_reports_tools_required_by_installed_packages(weld: WeldRunner) -> None:
+    archive = _make_config_archive(
+        weld.root, {"requires": ["git"]}, {"bin/main.py": "print('clock')\n"},
+    )
+    weld.install(archive)
+    # Simulate a package that was installed when its tool was still available.
+    packages = weld.packages()
+    packages["clock"]["requires"] = ["git", "not-installed-tool"]
+    (weld.home / ".weld" / "packages.json").write_text(
+        json.dumps(packages), encoding="utf-8",
+    )
+
+    result = weld.ok("--doctor")
+    assert "Tool requirements from installed packages" in result.stdout
+    assert "not-installed-tool" in result.stdout
+    assert "clock" in result.stdout
+
+
+def test_unknown_config_keys_warn_but_do_not_block(weld: WeldRunner) -> None:
+    archive = _make_config_archive(
+        weld.root, {"dependancies": ["rich"]}, {"bin/main.py": "print('clock')\n"},
+    )
+    result = weld.install(archive)
+    assert "Unknown key 'dependancies'" in result.stdout
+    assert "Installed" in result.stdout

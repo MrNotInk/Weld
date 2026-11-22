@@ -80,6 +80,45 @@ remain unchanged; reinstall an unpinned package with `weld --install <package>`
 version has not changed. `--update` / `--update-all` are for application
 packages, not for updating Weld.
 
+### Package options (`config.json`)
+
+Besides the required `name` and `version` (and `deps` / `desc`, which default
+to `[]` / `""`), a project or archive `config.json` accepts:
+
+```json
+{
+  "name": "clock",
+  "version": "1.1.1",
+  "desc": "Terminal clock",
+  "deps": [],
+
+  "entry": "cli.py",
+  "aliases": ["clk", "time-now"],
+  "env": {"CLOCK_MODE": "fast"},
+  "auto_pip_install": false,
+
+  "min_weld_version": "0.6.4",
+  "python_requires": ">=3.11,<3.16",
+  "requires": ["git", "ffmpeg"]
+}
+```
+
+| Key | Meaning |
+|---|---|
+| `entry` | Script in `bin/` that becomes the command (default `main.py`). `.py` is optional; subdirectories are rejected. |
+| `aliases` | Extra command names installed next to the package name. Each is a small `#!/bin/sh` launcher that runs the real command, so they always share its shebang, GIL flag and env. |
+| `env` | Variables set **only for the package's command**, as `NAME='value'` words in its `env -S` shebang. Values cannot contain quotes, newlines or NUL. |
+| `auto_pip_install` | Per-package override of the global setting; `false` skips pip even when `deps` is set. |
+| `min_weld_version` | Oldest Weld that may install the package. Checked before anything is downloaded or written. |
+| `python_requires` | Version specifier such as `">=3.11"` or `">=3.11,<3.16"` (`==`, `!=`, `<`, `<=`, `>`, `>=`, `~=`, `3.12.*`). Installation stops with the running interpreter's version in the message. |
+| `requires` | External tools that must be on `PATH`. Every tool is listed as `found` / `missing`; if anything is missing **nothing is installed** and Weld tells you to install it and retry. `--doctor` also lists these per package. |
+
+Unknown keys produce a `Warning: Unknown key ... (ignored)` line, so typos such
+as `"dependancies"` no longer pass silently. `entry`, `aliases`, `env` and the
+requirement fields are stored in `packages.json` and shown by `--info`.
+`--build` and `--template` respect `entry` as well, and only the package's own
+command gets `env` / `-X gil=1` — helper scripts keep their own shebang.
+
 ### Configuration
 
 Weld stores its state in `~/.weld/` and reads `~/.weld/config.toml`:

@@ -7,6 +7,44 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 
 ---
 
+## [0.6.4] - 2026-11-22
+
+### Added
+
+- `config.json` now accepts optional package options, validated once by
+  `_normalize_config()` for both projects and archives:
+  - `entry` — the script in `bin/` that becomes the command (default
+    `main.py`). Used by `--install`, `--build` and `--template`; directories
+    and missing files are rejected.
+  - `aliases` — extra command names, installed as tiny `sh` launchers that
+    run the real command (so they inherit its shebang, GIL flag and env).
+    Aliases never overwrite files owned by another package.
+  - `env` — `NAME: value` pairs applied **only** to the package's command via
+    `NAME='value'` words in its `env -S` shebang; quotes/newlines/NUL are
+    rejected. Helper scripts and the caller's environment are untouched.
+  - `auto_pip_install` — per-package override of the global setting.
+  - `min_weld_version` — refuse to install on an older Weld.
+  - `python_requires` — specifier check (`>=3.11,<3.16`, `==3.12.*`,
+    `~=3.11`, ...) with the running interpreter's version in the error.
+  - `requires` — external tools that must be on `PATH`; each is reported as
+    `found` / `missing` and installation stops before any change until they
+    are installed. `--doctor` lists these tools per package (the global tool
+    table itself is unchanged).
+- Unknown `config.json` keys now print a warning instead of being ignored
+  silently, catching typos such as `"dependancies"`.
+- `--info` shows `Entry`, `Aliases`, `Requires`, `Python`, `Weld` and `Env`
+  for packages that use them; the applied options are stored in
+  `packages.json`.
+
+### Changed
+
+- `-X gil=1` (free-threaded builds) and `env` assignments are now added only
+  to the package's own command; helper scripts keep their own shebang.
+- Both version values are now `0.6.4` so the self-updater can detect this
+  release.
+
+---
+
 ## [0.6.3] - 2026-11-22
 
 ### Changed

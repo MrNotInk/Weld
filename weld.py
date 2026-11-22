@@ -49,7 +49,7 @@ except ImportError:
 
 console = Console()
 
-VERSION = "0.6.3"
+VERSION = "0.6.4"
 
 WELD_DIR       = os.path.expanduser("~/.weld")
 WELD_BIN       = os.path.join(WELD_DIR, "bin")
@@ -99,6 +99,20 @@ _WELD_DIR_KNOWN = {
 # legacy "libs" list (bare .so module names from Cython builds) is still read
 # for packages installed by older Weld versions.
 _LIB_FILES_KEY = "_lib_files"
+
+# Keys understood in a project/archive config.json. Anything else is reported
+# (a typo such as "dependancies" would otherwise be ignored silently).
+_CONFIG_KEYS = {
+    "name", "version", "desc", "deps", "entry", "aliases", "env",
+    "auto_pip_install", "min_weld_version", "python_requires", "requires",
+}
+
+# Characters that need quoting inside an `env -S` shebang word. Values are
+# always wrapped in single quotes, so only the quote itself is a problem.
+_ENV_SHEBANG_FORBIDDEN = re.compile(r"[\x00\n\r'\"]")
+
+_ENV_NAME_RE = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*$")
+_ENTRY_NAME_RE = re.compile(r"^[A-Za-z0-9_][A-Za-z0-9_.\-]*$")
 
 # Saved tool options, managed with -Wnuitka / -Enuitka / -Wruff / -Eruff
 # (or by editing config.toml). Legacy Nuitka options are retained but ignored.
@@ -1184,6 +1198,122 @@ def _require_tool(tool: str, hint: str = "") -> str:
     return path
 
 
+def _parse_version_tuple(value: str) -> tuple[int, ...]:
+    """Return the numeric components of a version such as ``3.15.0b1``."""
+    return _parse_version(value)
+
+
+def _version_at_least(current: str, required: str) -> bool:
+    """Return True when *current* is equal to or newer than *required*."""
+    cur, req = _parse_version(current), _parse_version(required)
+    width = max(len(cur), len(req))
+    return cur + (0,) * (width - len(cur)) >= req + (0,) * (width - len(req))
+
+
+def _check_python_requires(spec: str) -> str | None:
+    """Return an error message when the running Python does not satisfy *spec*.
+
+    Supports the common specifier forms (``>=3.11``, ``>=3.11,<3.16``,
+    ``==3.12.*``, ``!=3.13``, ``~=3.11``) without extra dependencies.
+    """
+    current = ".".join(str(part) for part in sys.version_info[:3])
+    for raw_item in spec.split(","):
+        item = raw_item.strip()
+        if not item:
+            continue
+        match = re.match(r"^(~=|==|!=|<=|>=|<|>)\s*([0-9][0-9A-Za-z.*+\-]*)$", item)
+        if not match:
+            return f"invalid python_requires entry {item!r}"
+        operator, wanted = match.groups()
+        if wanted.endswith(".*"):
+            prefix = _parse_version(wanted[:-2])
+            same = _parse_version(current)[: len(prefix)] == prefix
+            ok = same if operator in ("==", "~=") else not same
+        elif operator == "~=":
+            parts = _parse_version(wanted)
+            ok = _version_at_least(current, wanted) and (
+                _parse_version(current)[: max(len(parts) - 1, 1)]
+                == parts[: max(len(parts) - 1, 1)]
+            )
+        else:
+            cmp_cur, cmp_want = _parse_version(current), _parse_version(wanted)
+            width = max(len(cmp_cur), len(cmp_want))
+            cmp_cur = cmp_cur + (0,) * (width - len(cmp_cur))
+            cmp_want = cmp_want + (0,) * (width - len(cmp_want))
+            ok = {
+                "==": cmp_cur == cmp_want,
+                "!=": cmp_cur != cmp_want,
+                "<=": cmp_cur <= cmp_want,
+                ">=": cmp_cur >= cmp_want,
+                "<": cmp_cur < cmp_want,
+                ">": cmp_cur > cmp_want,
+            }[operator]
+        if not ok:
+            return (
+                f"needs Python {spec}, but this interpreter is "
+                f"{sys.version.split()[0]}"
+            )
+    return None
+
+
+def _normalize_env(raw_env: object, source: str) -> dict[str, str]:
+    """Validate the optional per-package ``env`` mapping."""
+    if raw_env is None:
+        return {}
+    if not isinstance(raw_env, dict):
+        console.print(
+            f"[red]Error:[/red] 'env' in {_esc(source)} must be an object of "
+            "NAME: value pairs"
+        )
+        raise SystemExit(1)
+    env: dict[str, str] = {}
+    for key, value in raw_env.items():
+        if not isinstance(key, str) or not _ENV_NAME_RE.match(key):
+            console.print(
+                f"[red]Error:[/red] Invalid environment variable name "
+                f"'{_esc(key)}' in 'env' ({_esc(source)})"
+            )
+            raise SystemExit(1)
+        if isinstance(value, bool) or not isinstance(value, (str, int, float)):
+            console.print(
+                f"[red]Error:[/red] 'env' value for {_esc(key)} in "
+                f"{_esc(source)} must be a string"
+            )
+            raise SystemExit(1)
+        text_value = str(value)
+        if _ENV_SHEBANG_FORBIDDEN.search(text_value):
+            console.print(
+                f"[red]Error:[/red] 'env' value for {_esc(key)} in "
+                f"{_esc(source)} cannot contain quotes, newlines or NUL bytes"
+            )
+            raise SystemExit(1)
+        env[key] = text_value
+    return env
+
+
+def _resolve_entry(bin_dir: str, entry: object, source: str) -> str | None:
+    """Return the absolute path of the configured entry script in *bin_dir*."""
+    if entry in (None, ""):
+        return None
+    if not isinstance(entry, str) or not _ENTRY_NAME_RE.match(entry.strip()):
+        console.print(
+            f"[red]Error:[/red] 'entry' in {_esc(source)} must be a file name "
+            "without directories"
+        )
+        raise SystemExit(1)
+    name = entry.strip()
+    if not name.endswith(".py"):
+        name += ".py"
+    path = _safe_join(bin_dir, name)
+    if path is None or not os.path.isfile(path):
+        console.print(
+            f"[red]Error:[/red] 'entry' file bin/{_esc(name)} from "
+            f"{_esc(source)} was not found"
+        )
+        raise SystemExit(1)
+    return os.path.basename(path)
+
+
 def _normalize_config(raw: object, source: str) -> dict:
     """Validate a project/archive config dict and fill in defaults."""
     if not isinstance(raw, dict):
@@ -1215,8 +1345,107 @@ def _normalize_config(raw: object, source: str) -> dict:
         console.print(f"[red]Error:[/red] 'desc' in {_esc(source)} must be a string")
         raise SystemExit(1)
 
+    for key in sorted(set(raw) - _CONFIG_KEYS):
+        _print(
+            f"{_YELLOW}Warning:{_RESET} Unknown key '{_esc(key)}' in "
+            f"{_esc(source)} {_DIM}(ignored){_RESET}"
+        )
+
+    entry = raw.get("entry", "")
+    if entry not in (None, "") and not isinstance(entry, str):
+        console.print(f"[red]Error:[/red] 'entry' in {_esc(source)} must be a string")
+        raise SystemExit(1)
+
+    aliases = raw.get("aliases", [])
+    if not isinstance(aliases, list) or not all(
+        isinstance(alias, str) and alias.strip() for alias in aliases
+    ):
+        console.print(
+            f"[red]Error:[/red] 'aliases' in {_esc(source)} must be a list of "
+            "command names"
+        )
+        raise SystemExit(1)
+    clean_aliases: list[str] = []
+    for alias in aliases:
+        alias = alias.strip()
+        if not _PKG_NAME_RE.match(alias) or alias.lower() in _RESERVED_PKG_NAMES:
+            console.print(
+                f"[red]Error:[/red] Invalid alias '{_esc(alias)}' in "
+                f"{_esc(source)}"
+            )
+            raise SystemExit(1)
+        if alias == name.strip():
+            continue
+        if alias not in clean_aliases:
+            clean_aliases.append(alias)
+
+    auto_pip = raw.get("auto_pip_install")
+    if auto_pip is not None and not isinstance(auto_pip, bool):
+        console.print(
+            f"[red]Error:[/red] 'auto_pip_install' in {_esc(source)} must be "
+            "true or false"
+        )
+        raise SystemExit(1)
+
+    min_weld = raw.get("min_weld_version", "")
+    if min_weld in (None, ""):
+        min_weld = ""
+    elif isinstance(min_weld, bool) or not isinstance(min_weld, (str, int, float)):
+        console.print(
+            f"[red]Error:[/red] 'min_weld_version' in {_esc(source)} must be a "
+            "version string"
+        )
+        raise SystemExit(1)
+    else:
+        min_weld = str(min_weld).strip()
+
+    python_requires = raw.get("python_requires", "")
+    if python_requires in (None, ""):
+        python_requires = ""
+    elif not isinstance(python_requires, str):
+        console.print(
+            f"[red]Error:[/red] 'python_requires' in {_esc(source)} must be a "
+            "string such as \">=3.11\""
+        )
+        raise SystemExit(1)
+    else:
+        python_requires = python_requires.strip()
+
+    requires = raw.get("requires", [])
+    if not isinstance(requires, list) or not all(
+        isinstance(tool, str) and tool.strip() for tool in requires
+    ):
+        console.print(
+            f"[red]Error:[/red] 'requires' in {_esc(source)} must be a list of "
+            "tool names"
+        )
+        raise SystemExit(1)
+    clean_requires: list[str] = []
+    for tool in requires:
+        tool = tool.strip()
+        if not re.match(r"^[A-Za-z0-9][A-Za-z0-9_.+\-]*$", tool):
+            console.print(
+                f"[red]Error:[/red] Invalid tool name '{_esc(tool)}' in "
+                f"{_esc(source)}"
+            )
+            raise SystemExit(1)
+        if tool not in clean_requires:
+            clean_requires.append(tool)
+
     config = dict(raw)
-    config.update(name=name.strip(), version=str(version).strip(), deps=list(deps), desc=desc)
+    config.update(
+        name=name.strip(),
+        version=str(version).strip(),
+        deps=list(deps),
+        desc=desc,
+        entry=(entry or "").strip(),
+        aliases=clean_aliases,
+        env=_normalize_env(raw.get("env"), source),
+        auto_pip_install=auto_pip,
+        min_weld_version=min_weld,
+        python_requires=python_requires,
+        requires=clean_requires,
+    )
     return config
 
 
@@ -1870,20 +2099,38 @@ def remove_changelog(pkg_name: str, silent: bool = False) -> None:
 # Script preparation and installed libraries
 # ---------------------------------------------------------------------------
 
-def _gil_enabled_shebang(shebang: bytes) -> bytes:
-    """Preserve a Python command but explicitly enable the GIL at startup.
+def _shebang_env_assignments(env: dict[str, str] | None) -> bytes:
+    """Render ``NAME='value'`` words for an ``env -S`` shebang."""
+    if not env:
+        return b""
+    words = []
+    for key, value in env.items():
+        if _ENV_SHEBANG_FORBIDDEN.search(value):
+            raise ValueError(
+                f"Environment value for {key} cannot contain quotes or newlines"
+            )
+        words.append(f"{key}='{value}'".encode())
+    return b" ".join(words) + b" "
 
-    env -S lets the kernel's single shebang argument carry interpreter flags.
-    Keep the original command's quoting and flags, including env assignments.
+
+def _augment_shebang(
+    shebang: bytes, *, enable_gil: bool = False,
+    env: dict[str, str] | None = None,
+) -> bytes:
+    """Preserve a Python command, adding env vars and/or explicit GIL startup.
+
+    ``env -S`` lets the kernel's single shebang argument carry interpreter
+    flags and ``NAME='value'`` assignments. The original command's quoting and
+    flags are kept.
     """
     command = shebang.removeprefix(b"#!").strip()
     parts = command.split(None, 1)
     if not parts:
         raise ValueError("Missing interpreter in Python shebang")
 
-    env = b"/usr/bin/env"
+    env_program = b"/usr/bin/env"
     if os.path.basename(parts[0]) == b"env":
-        env = parts[0]
+        env_program = parts[0]
         command = parts[1] if len(parts) > 1 else b""
         command = re.sub(br"^(?:-S\s*|--split-string(?:=|\s+))", b"", command)
     if not command:
@@ -1895,14 +2142,25 @@ def _gil_enabled_shebang(shebang: bytes) -> bytes:
     if marker:
         command = command[:marker.start()]
         terminator = b" --"
-    return b"#!" + env + b" -S " + command + b" -X gil=1" + terminator + b"\n"
+    return (
+        b"#!" + env_program + b" -S "
+        + _shebang_env_assignments(env)
+        + command
+        + (b" -X gil=1" if enable_gil else b"")
+        + terminator + b"\n"
+    )
+
+
+def _gil_enabled_shebang(shebang: bytes) -> bytes:
+    """Preserve a Python command but explicitly enable the GIL at startup."""
+    return _augment_shebang(shebang, enable_gil=True)
 
 
 def compile_py_nuitka(
     full_path: str, cwd: str,
     line_cb=None,
     opts: list[str] | None = None,
-    *, enable_gil: bool = False,
+    *, enable_gil: bool = False, env: dict[str, str] | None = None,
 ) -> subprocess.CompletedProcess:
     """Turn a .py file into an executable Python script without Nuitka.
 
@@ -1912,6 +2170,8 @@ def compile_py_nuitka(
     added without changing the other permissions. *enable_gil* adds -X gil=1
     to the shebang for installed native libraries on free-threaded Python,
     without changing the script body or declaring them GIL-independent.
+    *env* adds ``NAME='value'`` assignments to the shebang, so they are set only
+    for that command and never leak into the caller's environment.
 
     The legacy name, *opts* (ignored), callback, and CompletedProcess return
     value are retained for compatibility. The source is removed only after
@@ -1943,9 +2203,11 @@ def compile_py_nuitka(
                 header += f"# coding: {encoding}\n".encode("ascii")
             script = header + source
 
-        if enable_gil:
+        if enable_gil or env:
             shebang, _, body = script.partition(b"\n")
-            script = _gil_enabled_shebang(shebang) + body
+            script = _augment_shebang(
+                shebang, enable_gil=enable_gil, env=env,
+            ) + body
 
         with open(output, "xb") as fp:
             created_output = True
@@ -2002,10 +2264,12 @@ def compile_py_pyinstaller(full_path: str, cwd: str) -> subprocess.CompletedProc
 
 def _compile_nuitka_live(
     full_path: str, cwd: str, label: str, opts: list[str] | None = None,
-    *, enable_gil: bool = False,
+    *, enable_gil: bool = False, env: dict[str, str] | None = None,
 ) -> subprocess.CompletedProcess:
     """Prepare an executable script and display its status (legacy name)."""
-    result = compile_py_nuitka(full_path, cwd, opts=opts, enable_gil=enable_gil)
+    result = compile_py_nuitka(
+        full_path, cwd, opts=opts, enable_gil=enable_gil, env=env,
+    )
     icon = f"{_GREEN}✔{_RESET}" if result.returncode == 0 else f"{_RED}✘{_RESET}"
     _write(f"\r{_CLEAR_LINE}{icon} {label}\n")
     return result
@@ -2134,18 +2398,20 @@ def cmd_template(template_name: str) -> None:
             _print(f"  {_CYAN}•{_RESET} {t}")
         raise SystemExit(1)
 
-    main_py = os.path.join("bin", "main.py")
+    entry_name = _resolve_entry("bin", project_config.get("entry"), "config.json")
+    main_py = os.path.join("bin", entry_name or "main.py")
+    display = os.path.relpath(main_py, "bin")
     if os.path.isfile(main_py):
         # Use a timestamped backup so repeated calls don't overwrite each other.
         # Backups are excluded from .wld archives (*.bak suffix).
         ts_tag = datetime.now().strftime("%Y%m%d_%H%M%S")
         backup = f"{main_py}.{ts_tag}.bak"
         shutil.copy2(main_py, backup)
-        _print(f"{_DIM}Backed up bin/main.py -> {backup}{_RESET}")
+        _print(f"{_DIM}Backed up bin/{display} -> {backup}{_RESET}")
 
     _atomic_write(main_py, tpl["code"])
 
-    _print(f"{_GREEN}{_BOLD}✔ Template applied:{_RESET} '{template_name}' -> bin/main.py")
+    _print(f"{_GREEN}{_BOLD}✔ Template applied:{_RESET} '{template_name}' -> bin/{display}")
 
     existing_deps = project_config.get("deps", [])
     template_deps = [d for d in tpl.get("deps", []) if isinstance(d, str)]
@@ -2200,13 +2466,14 @@ def cmd_build(directory: str) -> None:
     _validate_pkg_name(config["name"])
 
     bin_dir  = os.path.join(directory, "bin")
-    main_py  = os.path.join(bin_dir, "main.py")
     libs_dir = os.path.join(bin_dir, "libs")
 
     if not os.path.isdir(bin_dir):
         console.print("[red]Error:[/red] bin/ directory not found")
         raise SystemExit(1)
-    if not os.path.isfile(main_py):
+    if _resolve_entry(bin_dir, config.get("entry"), "config.json") is None and not os.path.isfile(
+        os.path.join(bin_dir, "main.py")
+    ):
         console.print("[red]Error:[/red] main.py not found in bin/")
         raise SystemExit(1)
 
@@ -2290,6 +2557,100 @@ def cmd_build(directory: str) -> None:
     _call_hook(global_plugin, "after_build", config, archive_path)
     _log("BUILD", config["name"], config["version"])
     console.print(f"[bold green]Wlded:[/bold green] {archive_path}")
+
+
+def _check_package_requirements(config: dict) -> None:
+    """Refuse to install when a package's declared requirements are not met.
+
+    ``min_weld_version`` and ``python_requires`` are checked against the
+    running Weld/interpreter, then every tool in ``requires`` must be on PATH.
+    Nothing is downloaded, installed or modified when a check fails.
+    """
+    pkg_name = str(config.get("name", "package"))
+    min_weld = str(config.get("min_weld_version") or "").strip()
+    if min_weld and not _version_at_least(VERSION, min_weld):
+        console.print(
+            f"[red]Error:[/red] '{_esc(pkg_name)}' needs Weld {_esc(min_weld)} "
+            f"or newer, but this is {_esc(VERSION)}."
+        )
+        _print(f"{_DIM}Update Weld first: weld --self-upgrade{_RESET}")
+        raise SystemExit(1)
+
+    python_requires = str(config.get("python_requires") or "").strip()
+    if python_requires:
+        problem = _check_python_requires(python_requires)
+        if problem:
+            console.print(
+                f"[red]Error:[/red] '{_esc(pkg_name)}' {_esc(problem)}."
+            )
+            _print(
+                f"{_DIM}Install it with a supported interpreter, for example "
+                f"python3.12 -m weld --install {_esc(pkg_name)}{_RESET}"
+            )
+            raise SystemExit(1)
+
+    required = [str(tool) for tool in config.get("requires") or []]
+    missing = [tool for tool in required if shutil.which(tool) is None]
+    if missing:
+        console.print(
+            f"[red]Error:[/red] '{_esc(pkg_name)}' needs "
+            f"{_esc(', '.join(missing))} to run, but "
+            f"{'it was' if len(missing) == 1 else 'they were'} not found on PATH."
+        )
+        for tool in required:
+            state = "missing" if tool in missing else "found"
+            colour = _RED if tool in missing else _GREEN
+            _print(f"  {colour}{state}{_RESET}  {tool}")
+        _print(
+            f"{_DIM}Install the missing tool(s) and run the command again; "
+            f"'{_esc(pkg_name)}' was not installed.{_RESET}"
+        )
+        raise SystemExit(1)
+
+
+def _alias_launcher(command: str) -> bytes:
+    """Return a tiny POSIX shim that runs *command* from the same directory."""
+    return (
+        "#!/bin/sh\n"
+        f'exec "$(dirname "$0")/{command}" "$@"\n'
+    ).encode()
+
+
+def _install_aliases(
+    command: str, aliases: list[str], created_abs: list[str],
+    forbidden: set[str], keep: set[str],
+) -> list[str]:
+    """Create alias launchers next to *command*; return their relative names.
+
+    *forbidden* holds paths owned by other packages and *keep* the files the
+    installed version already owned, so an existing unrelated file is never
+    silently overwritten.
+    """
+    installed: list[str] = []
+    for alias in aliases:
+        target = _safe_join(WELD_BIN, alias)
+        if target is None or os.path.dirname(target) != os.path.abspath(WELD_BIN):
+            console.print(f"[red]Error:[/red] Invalid alias '{_esc(alias)}'")
+            raise SystemExit(1)
+        if alias in forbidden:
+            console.print(
+                f"[red]Error:[/red] Alias '{_esc(alias)}' is already used by "
+                "another installed package."
+            )
+            raise SystemExit(1)
+        if os.path.exists(target) and alias not in keep:
+            console.print(
+                f"[red]Error:[/red] Cannot create alias '{_esc(alias)}': "
+                f"{_esc(target)} already exists."
+            )
+            raise SystemExit(1)
+        existed = os.path.exists(target)
+        _atomic_write(target, _alias_launcher(command))
+        os.chmod(target, 0o755)
+        if not existed:
+            created_abs.append(target)
+        installed.append(alias)
+    return installed
 
 
 def _copy_tree_tracked(
@@ -2580,6 +2941,20 @@ def _cmd_install(wld_file: str, log_action: bool = True) -> None:
     version = config["version"]
     deps    = config["deps"]
     desc    = config["desc"]
+    aliases = list(config.get("aliases") or [])
+    env     = dict(config.get("env") or {})
+    if aliases:
+        reserved = set(aliases) & _RESERVED_PKG_NAMES
+        if reserved:
+            console.print(
+                f"[red]Error:[/red] Alias '{_esc(min(reserved))}' is "
+                "reserved by weld."
+            )
+            raise SystemExit(1)
+
+    # Stop before downloading, installing dependencies or touching ~/.weld
+    # when this package cannot work here.
+    _check_package_requirements(config)
 
     global_plugin = _load_global_plugin()
     os.makedirs(WELD_BIN, exist_ok=True)
@@ -2607,7 +2982,11 @@ def _cmd_install(wld_file: str, log_action: bool = True) -> None:
     _call_hook(global_plugin, "before_install", config)
 
     if deps:
-        if get_auto_pip_install():
+        if config["auto_pip_install"] is not None:
+            auto_pip = bool(config["auto_pip_install"])
+        else:
+            auto_pip = get_auto_pip_install()
+        if auto_pip:
             _print(f"\n{_BOLD}{_CYAN}Installing dependencies...{_RESET}")
             for idx, dep in enumerate(deps, 1):
                 _progress(idx, len(deps), dep)
@@ -2639,12 +3018,19 @@ def _cmd_install(wld_file: str, log_action: bool = True) -> None:
             raise SystemExit(1)
         tmp_libs = os.path.join(tmp_bin, "libs")
 
-        # Rename main.py -> <pkg>.py so the executable is named after the
-        # package. Prepare scripts / compile inside the temporary directory so
-        # a failure can never leave half-installed files in ~/.weld.
-        main_src = os.path.join(tmp_bin, "main.py")
+        # Rename the entry script (main.py unless config.json says otherwise)
+        # to <pkg>.py so the executable is named after the package. Prepare
+        # scripts / compile inside the temporary directory so a failure can
+        # never leave half-installed files in ~/.weld.
+        entry_file = _resolve_entry(tmp_bin, config.get("entry"), "archive config.json")
+        if entry_file and entry_file != "main.py":
+            _print(f"{_DIM}Entry: bin/{entry_file}{_RESET}")
+        main_src = os.path.join(tmp_bin, entry_file or "main.py")
         main_dst = os.path.join(tmp_bin, f"{pkg_name}.py")
-        if os.path.isfile(main_src) and os.path.abspath(main_src) != os.path.abspath(main_dst):
+        if not os.path.isfile(main_src):
+            console.print("[red]Error:[/red] bin/main.py not found in archive")
+            raise SystemExit(1)
+        if os.path.abspath(main_src) != os.path.abspath(main_dst):
             os.replace(main_src, main_dst)
 
         py_files = filter_files(tmp_bin, ".py")
@@ -2675,7 +3061,12 @@ def _cmd_install(wld_file: str, log_action: bool = True) -> None:
                     _progress(idx, len(py_files), py_file)
                     if compiler == "nuitka":
                         result = _compile_nuitka_live(
-                            full, tmp_bin, py_file, opts=nuitka_opts, enable_gil=enable_gil,
+                            full, tmp_bin, py_file, opts=nuitka_opts,
+                            # Startup flags only matter for the command the
+                            # script itself provides; helper scripts keep their
+                            # own shebang.
+                            enable_gil=enable_gil and py_file == f"{pkg_name}.py",
+                            env=env if py_file == f"{pkg_name}.py" else None,
                         )
                     else:
                         with spinner(f"{compiler}  {py_file}"):
@@ -2748,6 +3139,15 @@ def _cmd_install(wld_file: str, log_action: bool = True) -> None:
                     if entry in binary_names and compiler == "pyinstaller":
                         os.chmod(dst, 0o755)
 
+            if aliases:
+                keep = {str(rel) for rel in old_info.get("files", [])} if old_info else set()
+                installed_files.extend(
+                    _install_aliases(pkg_name, aliases, created_files, other_files, keep)
+                )
+                _print(
+                    f"{_DIM}Aliases: {', '.join(aliases)} -> {pkg_name}{_RESET}"
+                )
+
             copied_lib_files, created_lib_files = install_libs_as_is(
                 tmp_libs, WELD_LIBS, set(_lib_extras(old_info)) if old_info else set(),
             )
@@ -2772,6 +3172,12 @@ def _cmd_install(wld_file: str, log_action: bool = True) -> None:
                     "desc":          desc,
                     "files":         sorted(installed_files),
                     _LIB_FILES_KEY:  sorted(copied_lib_rel),
+                    "entry":         entry_file or "",
+                    "aliases":       sorted(aliases),
+                    "env":           dict(env),
+                    "min_weld_version":  config.get("min_weld_version", ""),
+                    "python_requires":   config.get("python_requires", ""),
+                    "requires":          list(config.get("requires") or []),
                     "has_readme":    has_readme,
                     "has_changelog": has_changelog,
                     "pinned":        datac[pkg_name].get("pinned", False) if already else False,
@@ -3085,6 +3491,20 @@ def cmd_info(pkg_name: str) -> None:
     _print(f"  {_BOLD}Dependencies:{_RESET} {', '.join(deps)  if deps  else '-'}")
     _print(f"  {_BOLD}Files:{_RESET}        {', '.join(files) if files else '-'}")
     _print(f"  {_BOLD}Libs:{_RESET}         {', '.join(libs)  if libs  else '-'}")
+
+    if info.get("entry"):
+        _print(f"  {_BOLD}Entry:{_RESET}        bin/{info['entry']}")
+    if info.get("aliases"):
+        _print(f"  {_BOLD}Aliases:{_RESET}      {', '.join(info['aliases'])}")
+    if info.get("requires"):
+        _print(f"  {_BOLD}Requires:{_RESET}     {', '.join(info['requires'])}")
+    if info.get("python_requires"):
+        _print(f"  {_BOLD}Python:{_RESET}       {info['python_requires']}")
+    if info.get("min_weld_version"):
+        _print(f"  {_BOLD}Weld:{_RESET}         >= {info['min_weld_version']}")
+    if info.get("env"):
+        rendered = ", ".join(f"{k}={v}" for k, v in info["env"].items())
+        _print(f"  {_BOLD}Env:{_RESET}          {rendered}")
 
     note = info.get("note", "").strip()
     if note:
@@ -3676,6 +4096,24 @@ def cmd_doctor() -> None:
             _esc(str(version)), required,
         )
     console.print(table)
+
+    needed: dict[str, list[str]] = {}
+    for pkg_name, pkg_info in load_packages().items():
+        if not isinstance(pkg_info, dict):
+            continue
+        for tool in pkg_info.get("requires", []):
+            needed.setdefault(str(tool), []).append(pkg_name)
+    if needed:
+        _print(f"\n{_BOLD}Tool requirements from installed packages{_RESET}")
+        for tool in sorted(needed):
+            found = shutil.which(tool) is not None
+            colour = _GREEN if found else _RED
+            state = "found" if found else "missing"
+            _print(
+                f"  {colour}{state:<8}{_RESET} {tool:<12} "
+                f"{_DIM}({', '.join(sorted(needed[tool]))}){_RESET}"
+            )
+
     _print(f"{_DIM}nuitka options (ignored): {shlex.join(get_nuitka_opts()) or '(none)'}{_RESET}")
     _print(f"{_DIM}ruff options:   {shlex.join(get_ruff_opts()) or '(none)'}{_RESET}")
     _print()

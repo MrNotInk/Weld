@@ -206,14 +206,15 @@ def test_display_wrapper_delegates_to_script_preparation(
     expected = subprocess.CompletedProcess(["app.py"], returncode, stdout="", stderr="")
     calls = []
 
-    def prepare(full_path, cwd, *, opts, enable_gil):
-        calls.append((full_path, cwd, opts, enable_gil))
+    def prepare(full_path, cwd, *, opts, enable_gil, env=None):
+        calls.append((full_path, cwd, opts, enable_gil, env))
         return expected
 
     monkeypatch.setattr(weld_module, "compile_py_nuitka", prepare)
     result = weld_module._compile_nuitka_live(
         "app.py", ".", "app.py", opts=[], enable_gil=enable_gil,
+        env={"CLOCK_MODE": "fast"},
     )
     assert result is expected
-    assert calls == [("app.py", ".", [], enable_gil)]
+    assert calls == [("app.py", ".", [], enable_gil, {"CLOCK_MODE": "fast"})]
     assert ("✔" if returncode == 0 else "✘") in capsys.readouterr().out
