@@ -7,6 +7,27 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 
 ---
 
+## [0.6.0] - 2026-11-22
+
+### Changed
+
+- Version bumped from `0.5.1` to **`0.6.0`** in both `weld.py` and the
+  repository `version` file, so existing users can detect it with
+  `weld --check-update` and install it with `weld --self-upgrade`.
+- The legacy `compiler = "nuitka"` mode now installs executable Python
+  scripts instead of invoking Nuitka: it removes the final `.py` extension,
+  preserves an existing shebang or adds `#!/usr/bin/env python3`, and adds
+  execute permissions without changing the other permission bits. The
+  source is removed only after preparation succeeds, and existing output
+  files are never overwritten. Python and the application's dependencies
+  must remain available at runtime.
+- Nuitka is no longer a dependency or a `--doctor` requirement. Existing
+  `nuitka_opts` and `-Wnuitka` / `-Enuitka` flags are retained for compatibility
+  but explicitly ignored. PyInstaller and Cython builds are unchanged.
+- Installation no longer strips `.bin` extensions from unrelated data files.
+
+---
+
 ## [0.5.1] - 2026-10-26
 
 ### Fixed

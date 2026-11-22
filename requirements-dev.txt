@@ -1,7 +1,7 @@
 # Development / test dependencies for weld
 #
 # The test-suite only needs the core runtime, ruff (used by `weld --build`)
-# and pytest.  The real compilers are replaced by fakes during tests.
+# and pytest. Script installs run real Python; PyInstaller is faked.
 #
 #     python -m pip install -r requirements-dev.txt
 #     python -m pytest

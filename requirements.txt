@@ -14,14 +14,15 @@ tomli>=2.0.0; python_version < "3.11"
 # --- code validation ------------------------------------------------------
 ruff>=0.5.0
 
-# --- compilation engines --------------------------------------------------
-# At least one of nuitka / pyinstaller is required to install packages.
+# --- optional compilation engines -----------------------------------------
+# The default (legacy "nuitka") mode installs executable Python scripts;
+# it does not require Nuitka or any native compilation tool.
 # Cython + setuptools are required for packages that ship bin/libs/*.py.
+# PyInstaller is only required when compiler = "pyinstaller" is selected.
 cython>=3.0.0
 setuptools>=68.0.0
-nuitka>=2.4; python_version < "3.14"
 pyinstaller>=6.0; python_version < "3.14"
 
-# Note: Nuitka and PyInstaller do not support every Python release on day
-# one.  If you are on a very new Python version, install a compiler release
-# that supports it manually, or use Python 3.11-3.13.
+# Note: PyInstaller does not support every Python release on day one.
+# On a very new Python version, use the default script mode, install a
+# PyInstaller release that supports it manually, or use Python 3.11-3.13.
