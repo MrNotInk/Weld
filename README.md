@@ -92,8 +92,35 @@ nuitka_opts = []           # legacy setting, saved but ignored
 ruff_opts = ["--no-cache", "--output-format=concise"]  # `ruff check` options
 ```
 
-Run `weld --doctor` at any time to check which tools are available. Tools that
-are not required for the configured compiler are reported as optional.
+Run `weld --doctor` at any time to check which tools are available. Optional
+tools are labelled accordingly. PyInstaller is not probed or listed by doctor;
+its availability is still checked during installation when
+`compiler = "pyinstaller"` is selected.
+
+#### Detailed error logs
+
+When a Weld command fails, Weld saves a uniquely named report in
+`~/.weld/logs/weld-error-<timestamp>-<pid>-<id>.log` and prints
+`Full error log: <path>` to stderr. This also covers argument/configuration
+errors, unexpected exceptions, and individual failures during `--update-all`.
+Successful commands and `--help` do not leave error logs.
+
+Reports include the command and working directory, full chained traceback,
+console output, and **untruncated stdout and stderr from captured subprocesses**
+(including successful steps and fallback attempts). Python's executable,
+version, virtual environment, ABI/GIL settings, C compiler configuration,
+tool paths, build-package versions, Weld settings, and relevant build
+environment variables are included. Cython reports also retain the generated
+setup script before temporary build files are removed; errors printed only
+to stdout are no longer lost.
+
+Logs are created with owner-only file permissions. The environment is limited
+to a build-related allowlist, not dumped wholesale, but commands and tool output
+may still contain private data: **review a log before sharing it**. `--clean`
+preserves the entire logs directory; delete old reports manually when no longer
+needed. If a report cannot be written, Weld warns without replacing the original
+error. These reports cover Weld's own operations, not errors from installed
+applications run directly (or after `--run` hands control to the application).
 
 #### Executable script mode (legacy `nuitka` setting)
 
