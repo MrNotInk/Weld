@@ -7,6 +7,37 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 
 ---
 
+## [0.6.2] - 2026-11-22
+
+### Added
+
+- Failed Weld commands now write private, uniquely named error reports under
+  `~/.weld/logs` and print the saved path. Reports include full tracebacks,
+  console output, subprocess commands/cwd/return codes and untruncated stdout
+  and stderr, Python/ABI/GIL and toolchain details, build-package versions,
+  Weld settings, and allowlisted build environment variables. Cython's
+  generated setup script is retained in the report even after temporary build
+  directories are removed. Individual `--update-all` failures are logged too.
+- Successful commands do not leave error logs; `--clean` preserves all logs.
+  Logging failures warn without hiding the original error.
+
+### Fixed
+
+- Cython failures now show stdout as well as stderr and include the process
+  exit code (or an explicit message when both streams are empty). Failed builds
+  no longer display a success checkmark, and the compiler/header hint no longer
+  prints a literal `{_RESET}` placeholder.
+
+### Changed
+
+- Removed PyInstaller from `--doctor` output and tool probes, even when it is
+  the configured compiler. PyInstaller installation support and its install-time
+  availability check are unchanged.
+- Bumped both version values to `0.6.2` so the self-updater can detect these
+  changes once merged.
+
+---
+
 ## [0.6.1] - 2026-11-22
 
 ### Fixed

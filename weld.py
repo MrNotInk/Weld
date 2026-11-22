@@ -6,6 +6,7 @@ import glob
 import importlib.util
 import json
 import os
+import platform
 import py_compile
 import re
 import shlex
@@ -17,10 +18,12 @@ import tempfile
 import threading
 import time
 import tokenize
+import traceback
 import zipfile
 from collections import defaultdict
 from contextlib import contextmanager
-from datetime import datetime
+from datetime import datetime, timezone
+from importlib import metadata
 
 from rich.box import ROUNDED
 from rich.console import Console
@@ -47,7 +50,7 @@ except ImportError:
 
 console = Console()
 
-VERSION = "0.6.1"
+VERSION = "0.6.2"
 
 WELD_DIR       = os.path.expanduser("~/.weld")
 WELD_BIN       = os.path.join(WELD_DIR, "bin")
@@ -57,6 +60,7 @@ WELD_LOCK      = WELD_PACKAGES + ".lock"
 WELD_CONFIG    = os.path.join(WELD_DIR, "config.toml")
 WELD_README    = os.path.join(WELD_DIR, "Readme")
 WELD_HISTORY   = os.path.join(WELD_DIR, "history.log")
+WELD_LOGS      = os.path.join(WELD_DIR, "logs")
 WELD_PLUGINS   = os.path.join(WELD_DIR, "plugins")
 WELD_TEMPLATES = os.path.join(WELD_DIR, "templates")
 
@@ -89,7 +93,7 @@ WLD_EXT = ".wld"
 _WELD_DIR_KNOWN = {
     "bin", "Readme", "packages.json", "packages.json.lock",
     "config.toml", "_complete_packages.py", "history.log",
-    "plugins", "templates",
+    "logs", "plugins", "templates",
 }
 
 # Saved tool options, managed with -Wnuitka / -Enuitka / -Wruff / -Eruff
@@ -844,6 +848,274 @@ def _progress_done() -> None:
 
 
 # ---------------------------------------------------------------------------
+# Error diagnostics (separate from the --history action log)
+# ---------------------------------------------------------------------------
+
+_ANSI_ESCAPE_RE = re.compile(r"\x1b\[[0-?]*[ -/]*[@-~]")
+# Deliberately do not dump the entire environment: it can contain credentials.
+_BUILD_ENV_KEYS = (
+    "PATH", "VIRTUAL_ENV", "CONDA_PREFIX", "PYTHONHOME", "PYTHONPATH", "PYTHON_GIL",
+    "CC", "CXX", "CFLAGS", "CPPFLAGS", "CXXFLAGS", "LDFLAGS", "LDSHARED", "AR",
+    "LD_LIBRARY_PATH", "LIBRARY_PATH", "CPATH", "C_INCLUDE_PATH", "CPLUS_INCLUDE_PATH",
+    "PKG_CONFIG_PATH", "ARCHFLAGS", "SDKROOT", "MACOSX_DEPLOYMENT_TARGET", "LANG", "LC_ALL",
+)
+
+
+def _diagnostic_value(getter):
+    """Collect optional diagnostics without hiding the error being reported."""
+    try:
+        return getter()
+    except Exception as exc:  # noqa: BLE001 - optional diagnostics must not hide failures
+        return f"<unavailable: {type(exc).__name__}: {exc}>"
+
+
+def _diagnostic_now() -> datetime:
+    return datetime.now(timezone.utc)  # noqa: UP017 - keep Python 3.10 compatibility
+
+
+def _diagnostic_text(value) -> str:
+    if value is None:
+        return "<not captured>"
+    if isinstance(value, bytes):
+        return value.decode("utf-8", errors="backslashreplace")
+    return str(value)
+
+
+class _DiagnosticSession:
+    """Keep a complete journal, spilling to a private temp file for large builds.
+
+    Successful CLI runs discard it. Only failures persist a report in WELD_LOGS.
+    Recording is best-effort so a full disk cannot change an operation's result.
+    """
+
+    def __init__(self):
+        self.started = _diagnostic_now().isoformat()
+        self.argv = list(sys.argv)
+        self.cwd = _diagnostic_value(os.getcwd)
+        self.lock = threading.Lock()
+        self.last_source = None
+        self.recording_error = None
+        self.journal = tempfile.SpooledTemporaryFile(  # noqa: SIM115 - closed by main()
+            max_size=1 << 20, mode="w+", encoding="utf-8", errors="backslashreplace",
+        )
+
+    def record(self, text: str, source: str = "Diagnostics") -> None:
+        with self.lock:
+            if self.recording_error is not None:
+                return
+            try:
+                if source != self.last_source:
+                    self.journal.write(f"\n--- {source} ---\n")
+                    self.last_source = source
+                self.journal.write(_ANSI_ESCAPE_RE.sub("", text).replace("\r", "\n"))
+            except (OSError, ValueError) as exc:
+                self.recording_error = str(exc)
+
+    def copy_to(self, fp) -> None:
+        with self.lock:
+            if self.recording_error is not None:
+                fp.write(f"\nWarning: transcript recording failed: {self.recording_error}\n")
+            position = None
+            try:
+                position = self.journal.tell()
+                self.journal.seek(0)
+                shutil.copyfileobj(self.journal, fp)
+            except (OSError, ValueError) as exc:
+                fp.write(f"\nWarning: could not read the complete transcript: {exc}\n")
+            finally:
+                # --update-all may keep running and report another failure.
+                if position is not None:
+                    try:
+                        self.journal.seek(position)
+                    except (OSError, ValueError):
+                        pass
+
+    def close(self) -> None:
+        try:
+            self.journal.close()
+        except OSError:
+            pass
+
+
+class _DiagnosticStream:
+    """Tee Python/Rich output while preserving the original terminal interface."""
+
+    def __init__(self, stream, session: _DiagnosticSession, source: str):
+        self.stream = stream
+        self.session = session
+        self.source = source
+
+    def write(self, text: str):
+        result = self.stream.write(text)
+        self.session.record(text, self.source)
+        return result
+
+    def flush(self):
+        return self.stream.flush()
+
+    def __getattr__(self, name):
+        return getattr(self.stream, name)
+
+
+_diagnostics: _DiagnosticSession | None = None
+
+
+def _record_diagnostic(text: str) -> None:
+    if _diagnostics is not None:
+        _diagnostics.record(text)
+
+
+def _run_logged(cmd, *, check: bool = False, **kwargs) -> subprocess.CompletedProcess:
+    """Run a captured subprocess and retain both streams, even on timeouts.
+
+    Fallback attempts and successful steps are retained too, so a later failure
+    has the complete build history rather than just the last stderr message.
+    """
+    if kwargs.get("text") or kwargs.get("encoding") or kwargs.get("universal_newlines"):
+        kwargs.setdefault("errors", "backslashreplace")
+    if _diagnostics is None:
+        return subprocess.run(cmd, check=check, **kwargs)
+
+    command = cmd if isinstance(cmd, str) else shlex.join(os.fsdecode(arg) for arg in cmd)
+    cwd = _diagnostic_value(lambda: os.path.abspath(kwargs.get("cwd") or os.getcwd()))
+    _record_diagnostic(
+        f"\nSubprocess started: {_diagnostic_now().isoformat()}\n"
+        f"Command: {command}\nArguments: {cmd!r}\nWorking directory: {cwd}\n"
+        f"Timeout: {kwargs.get('timeout', '<none>')}\n"
+    )
+    if kwargs.get("env") is not None:
+        env = kwargs["env"]
+        _record_diagnostic("Build environment for this command:\n" + "".join(
+            f"  {key}={env[key]}\n" for key in _BUILD_ENV_KEYS if key in env
+        ))
+    started = time.monotonic()
+    try:
+        result = subprocess.run(cmd, check=check, **kwargs)
+    except Exception as exc:
+        _record_diagnostic(
+            f"Subprocess raised after {time.monotonic() - started:.3f}s:\n"
+            f"Return code: {getattr(exc, 'returncode', '<unavailable>')}\n"
+            f"{traceback.format_exc()}\n"
+            f"--- Subprocess stdout ---\n{_diagnostic_text(getattr(exc, 'stdout', None))}\n"
+            f"--- Subprocess stderr ---\n{_diagnostic_text(getattr(exc, 'stderr', None))}\n"
+        )
+        raise
+    _record_diagnostic(
+        f"Return code: {result.returncode}\nDuration: {time.monotonic() - started:.3f}s\n"
+        f"--- Subprocess stdout ---\n{_diagnostic_text(result.stdout)}\n"
+        f"--- Subprocess stderr ---\n{_diagnostic_text(result.stderr)}\n"
+    )
+    return result
+
+
+def _write_error_report(fp, exc: BaseException) -> None:
+    import sysconfig
+
+    session = _diagnostics
+    argv = session.argv if session is not None else list(sys.argv)
+    fp.write(
+        "Weld error report\n"
+        f"Weld version: {VERSION}\n"
+        f"Started (UTC): {session.started if session is not None else '<unknown>'}\n"
+        f"Failed (UTC): {_diagnostic_now().isoformat()}\n"
+        f"PID: {os.getpid()}\n"
+        f"Invocation: {shlex.join([sys.executable, *argv])}\n"
+        f"argv: {argv!r}\n"
+        f"Original Python argv: {getattr(sys, 'orig_argv', '<unavailable>')!r}\n"
+        f"Initial working directory: {session.cwd if session is not None else '<unknown>'}\n"
+        f"Current working directory: {_diagnostic_value(os.getcwd)}\n"
+        f"Weld file: {os.path.realpath(__file__)}\n"
+        f"Exception: {type(exc).__name__}: {exc}\n\n"
+        "--- Traceback (including chained exceptions) ---\n"
+    )
+    fp.writelines(traceback.format_exception(type(exc), exc, exc.__traceback__))
+    fp.write(
+        "\n--- Python and platform ---\n"
+        f"sys.executable: {sys.executable}\n"
+        f"Real executable: {os.path.realpath(sys.executable)}\n"
+        f"Python version: {sys.version}\n"
+        f"Implementation: {platform.python_implementation()}\n"
+        f"Platform: {sys.platform}\n"
+        f"OS: {_diagnostic_value(platform.system)} {_diagnostic_value(platform.release)}\n"
+        f"OS version: {_diagnostic_value(platform.version)}\n"
+        f"Machine: {_diagnostic_value(platform.machine)}\n"
+        f"sys.prefix: {sys.prefix}\nsys.base_prefix: {sys.base_prefix}\n"
+        f"sys.flags: {sys.flags}\n"
+        f"sys.path: {sys.path!r}\n"
+        f"GIL enabled: {_diagnostic_value(lambda: getattr(sys, '_is_gil_enabled', lambda: '<unavailable>')())}\n"
+        "\n--- Python build configuration ---\n"
+    )
+    for key in (
+        "SOABI", "EXT_SUFFIX", "Py_GIL_DISABLED", "MULTIARCH", "CC", "CXX", "CFLAGS",
+        "CPPFLAGS", "LDFLAGS", "LDSHARED", "LIBDIR", "LDLIBRARY", "CONFIG_ARGS",
+    ):
+        fp.write(f"{key}: {_diagnostic_value(lambda key=key: sysconfig.get_config_var(key))}\n")
+    fp.write(f"Python paths: {_diagnostic_value(sysconfig.get_paths)}\n")
+    fp.write("\n--- Installed build/runtime packages ---\n")
+    for package in ("Cython", "setuptools", "pip", "rich", "tomli-w", "ruff"):
+        fp.write(f"{package}: {_diagnostic_value(lambda package=package: metadata.version(package))}\n")
+    fp.write("\n--- Tool paths (no tools are executed to collect this section) ---\n")
+    cc = _diagnostic_value(lambda: sysconfig.get_config_var("CC"))
+    cc_parts = _diagnostic_value(lambda: shlex.split(cc or ""))
+    configured_cc = cc_parts[0] if isinstance(cc_parts, list) and cc_parts else "cc"
+    for tool in dict.fromkeys((configured_cc, "gcc", "cc", "clang", "uv", "ruff", "git")):
+        fp.write(f"{tool}: {_diagnostic_value(lambda tool=tool: shutil.which(tool))}\n")
+    fp.write("\n--- Build environment (allowlisted; not a full environment dump) ---\n")
+    for key in _BUILD_ENV_KEYS:
+        fp.write(f"{key}={os.environ.get(key, '<not set>')}\n")
+    fp.write("\n--- Weld settings ---\n")
+
+    def settings():
+        with open(WELD_CONFIG, "rb") as config_file:
+            config = tomllib.load(config_file).get("weld", {})
+        return {key: config[key] for key in DEFAULT_CONFIG["weld"] if key in config}
+
+    fp.write(f"{_diagnostic_value(settings)}\n")
+    fp.write(
+        "\n--- Complete console / subprocess journal ---\n"
+        "Subprocess streams below are untruncated. Terminal ANSI codes are removed.\n"
+        "Commands and tool output may contain private data; review before sharing.\n"
+    )
+    if session is not None:
+        session.copy_to(fp)
+
+
+def _report_error(exc: BaseException) -> str | None:
+    """Persist a unique, owner-only report; never replace the original failure."""
+    path = None
+    fd = None
+    try:
+        os.makedirs(WELD_LOGS, mode=0o700, exist_ok=True)
+        stamp = _diagnostic_now().strftime("%Y%m%d-%H%M%S-%f")
+        fd, path = tempfile.mkstemp(
+            prefix=f"weld-error-{stamp}-{os.getpid()}-", suffix=".log", dir=WELD_LOGS,
+        )
+        with os.fdopen(fd, "w", encoding="utf-8", errors="backslashreplace") as fp:
+            fd = None  # fdopen now owns the descriptor, including on write failure.
+            _write_error_report(fp, exc)
+        message = f"Full error log: {path}\n"
+    except Exception as log_exc:  # noqa: BLE001 - logging must never replace the original error
+        if fd is not None:
+            try:
+                os.close(fd)
+            except OSError:
+                pass
+        if path is not None:
+            try:
+                os.remove(path)
+            except OSError:
+                pass
+        path = None
+        message = f"Warning: could not write error log in {WELD_LOGS}: {log_exc}\n"
+    try:
+        sys.stderr.write(message)
+        sys.stderr.flush()
+    except (OSError, ValueError):
+        pass
+    return path
+
+
+# ---------------------------------------------------------------------------
 # Filesystem / archive helpers
 # ---------------------------------------------------------------------------
 
@@ -1499,7 +1771,7 @@ def ruff_check(
     """
     if opts is None:
         opts = get_ruff_opts()
-    result = subprocess.run(
+    result = _run_logged(
         ["ruff", "check", *opts, path],
         cwd=cwd, capture_output=True, text=True, check=False,
     )
@@ -1515,7 +1787,7 @@ def pip_install(package: str) -> str:
     """Install *package* via pip; returns 'uv' or 'pip' to indicate which was used.
     Raises RuntimeError with tool output on failure."""
     if _has_uv():
-        result = subprocess.run(
+        result = _run_logged(
             ["uv", "pip", "install", package],
             capture_output=True, text=True, check=False,
         )
@@ -1526,7 +1798,7 @@ def pip_install(package: str) -> str:
     else:
         uv_error = ""
 
-    result = subprocess.run(
+    result = _run_logged(
         [sys.executable, "-m", "pip", "install", package],
         capture_output=True, text=True, check=False,
     )
@@ -1686,6 +1958,7 @@ def compile_py_nuitka(
         os.chmod(output, mode | stat.S_IXUSR | stat.S_IXGRP | stat.S_IXOTH)
         os.remove(full_path)
     except (OSError, ValueError, SyntaxError) as exc:
+        _record_diagnostic(f"\nScript preparation failed for {full_path}:\n{traceback.format_exc()}\n")
         if created_output:
             try:
                 os.remove(output)
@@ -1709,7 +1982,7 @@ def compile_py_pyinstaller(full_path: str, cwd: str) -> subprocess.CompletedProc
     if not os.path.isabs(full_path):
         full_path = os.path.join(cwd, full_path)
 
-    result = subprocess.run(
+    result = _run_logged(
         [
             "pyinstaller", "--onefile",
             "--distpath", cwd,
@@ -1788,40 +2061,52 @@ def compile_to_so(python_file: str, inplace: bool = True) -> str:
         prefix="_weld_setup_", suffix=".py", dir=script_dir
     )
     os.close(fd)
-    with open(setup_path, "w", encoding="utf-8") as fp:
-        fp.write(setup_content)
+    _record_diagnostic(
+        f"\nCython source: {os.path.abspath(python_file)}\n"
+        f"Generated setup script: {setup_path}\n--- Setup script contents ---\n{setup_content}\n"
+    )
 
     try:
+        with open(setup_path, "w", encoding="utf-8") as fp:
+            fp.write(setup_content)
         cmd = [sys.executable, setup_path, "build_ext"]
         if inplace:
             cmd.append("--inplace")
 
         with spinner(f"Cython  {os.path.basename(python_file)}"):
-            result = subprocess.run(
+            result = _run_logged(
                 cmd, cwd=script_dir, capture_output=True, text=True, check=False
             )
+            if result.returncode != 0:
+                details = []
+                if result.stdout:
+                    details.append(f"stdout:\n{result.stdout.rstrip()}")
+                if result.stderr:
+                    details.append(f"stderr:\n{result.stderr.rstrip()}")
+                if not details:
+                    details.append("The build process produced no stdout or stderr.")
+                raise RuntimeError(
+                    f"Cython build failed (exit code {result.returncode}):\n" + "\n".join(details)
+                )
 
-        if result.returncode != 0:
-            raise RuntimeError(f"Cython build failed:\n{result.stderr}")
+            pattern = os.path.join(glob.escape(script_dir), glob.escape(base_name) + ".cpython-*.so")
+            so_files = sorted(glob.glob(pattern))
+            if not so_files:
+                raise RuntimeError("Cython .so was not generated")
 
-        pattern = os.path.join(glob.escape(script_dir), glob.escape(base_name) + ".cpython-*.so")
-        so_files = sorted(glob.glob(pattern))
-        if not so_files:
-            raise RuntimeError("Cython .so was not generated")
+            generated_so = so_files[0]
+            final_so     = os.path.join(script_dir, f"{base_name}.so")
 
-        generated_so = so_files[0]
-        final_so     = os.path.join(script_dir, f"{base_name}.so")
+            if os.path.abspath(generated_so) != os.path.abspath(final_so):
+                if os.path.exists(final_so):
+                    os.remove(final_so)
+                os.rename(generated_so, final_so)
 
-        if os.path.abspath(generated_so) != os.path.abspath(final_so):
-            if os.path.exists(final_so):
-                os.remove(final_so)
-            os.rename(generated_so, final_so)
+            c_file = os.path.join(script_dir, f"{base_name}.c")
+            if os.path.exists(c_file):
+                os.remove(c_file)
 
-        c_file = os.path.join(script_dir, f"{base_name}.c")
-        if os.path.exists(c_file):
-            os.remove(c_file)
-
-        return final_so
+            return final_so
 
     finally:
         if os.path.exists(setup_path):
@@ -2134,7 +2419,7 @@ def _fetch_registry() -> dict:
                 if attempt_branch:
                     cmd += ["--branch", attempt_branch]
                 cmd += [repo_url, clone_dir]
-                result = subprocess.run(
+                result = _run_logged(
                     cmd, capture_output=True, text=True, timeout=60, check=False
                 )
                 if result.returncode == 0 and os.path.isfile(
@@ -2263,6 +2548,11 @@ def _cmd_install(wld_file: str, log_action: bool = True) -> None:
     config = _read_archive_config(wld_file)
     pkg_name = config["name"]
     _validate_pkg_name(pkg_name)
+    _record_diagnostic(
+        f"\nInstalling archive: {wld_file}\nPackage configuration:\n"
+        + json.dumps({key: config[key] for key in ("name", "version", "deps", "desc")}, indent=2)
+        + "\n"
+    )
 
     version = config["version"]
     deps    = config["deps"]
@@ -2442,7 +2732,7 @@ def _cmd_install(wld_file: str, log_action: bool = True) -> None:
                         _print(str(exc))
                         _print(
                             f"{_DIM}Hint: a Cython build needs a C compiler "
-                            "(gcc) and Python headers (python3-dev).{_RESET}"
+                            f"(gcc) and Python headers (python3-dev).{_RESET}"
                         )
                         raise SystemExit(1)
                     compiled_libs.append(os.path.basename(so_path).removesuffix(".so"))
@@ -2716,10 +3006,13 @@ def cmd_update_all() -> None:
             _log("UPDATE", name, cfg["version"])
             updated.append(name)
             _print(f"{_GREEN}✔ Updated:{_RESET} {name} {cfg['version']}")
-        except SystemExit:
+        except SystemExit as exc:
             console.print(f"[red]Error:[/red] {_esc(name)}: update failed (see above)")
+            if exc.code not in (None, 0):
+                _report_error(exc)
         except Exception as exc:
             console.print(f"[red]Error:[/red] {_esc(name)}: {_esc(str(exc))}")
+            _report_error(exc)
         finally:
             if os.path.exists(tmp_path):
                 try:
@@ -3321,14 +3614,12 @@ def cmd_stats() -> None:
 
 
 def cmd_doctor() -> None:
-    compiler      = get_compiler()
     libs_compiler = get_libs_compiler()
 
     # (tool, version command, required?)
     tools = [
         ("python",      [sys.executable,  "--version"], True),
         ("ruff",        ["ruff",          "--version"], True),
-        ("pyinstaller", ["pyinstaller",   "--version"], compiler == "pyinstaller"),
         ("cython",      ["cython",        "--version"], False),
         ("setuptools",  [sys.executable,  "-c", "import setuptools"], False),
         ("mypy",        ["mypy",          "--version"], False),
@@ -3350,7 +3641,7 @@ def cmd_doctor() -> None:
 
     for name, cmd, required in tools:
         try:
-            result = subprocess.run(
+            result = _run_logged(
                 cmd, capture_output=True, text=True, timeout=5, check=False
             )
             if result.returncode == 0:
@@ -3523,6 +3814,9 @@ def cmd_clean() -> None:
 
     junk: list[str] = []
     for root, dirs, files in os.walk(WELD_DIR):
+        if root == WELD_DIR:
+            # Diagnostic evidence must survive cleanup, including any nested files.
+            dirs[:] = [directory for directory in dirs if directory != "logs"]
         for directory in list(dirs):
             if directory in _JUNK_DIRS:
                 junk.append(os.path.join(root, directory))
@@ -3888,7 +4182,7 @@ def _fetch_url_text(url: str, timeout: int = 15) -> str:
         if not exe:
             continue
         try:
-            result = subprocess.run(
+            result = _run_logged(
                 [exe, *extra_args, url],
                 capture_output=True, text=True, timeout=timeout, check=False,
             )
@@ -3918,7 +4212,7 @@ def _fetch_url_bytes(url: str, timeout: int = 30) -> bytes:
         try:
             with tempfile.NamedTemporaryFile(delete=False) as tmp:
                 tmp_path = tmp.name
-            result = subprocess.run(
+            result = _run_logged(
                 [curl, "-fsSL", "-o", tmp_path, url],
                 capture_output=True, text=True, timeout=timeout, check=False,
             )
@@ -3938,7 +4232,7 @@ def _fetch_url_bytes(url: str, timeout: int = 30) -> bytes:
         try:
             with tempfile.NamedTemporaryFile(delete=False) as tmp:
                 tmp_path = tmp.name
-            result = subprocess.run(
+            result = _run_logged(
                 [wget, "-qO", tmp_path, url],
                 capture_output=True, text=True, timeout=timeout, check=False,
             )
@@ -4109,7 +4403,7 @@ def _clone_repo_and_get_weld(version_only: bool = False) -> tuple[str, bytes | N
             else:
                 cmd = [git, "clone", "--depth", "1", repo_url, clone_dir]
 
-            result = subprocess.run(cmd, capture_output=True, text=True, timeout=60, check=False)
+            result = _run_logged(cmd, capture_output=True, text=True, timeout=60, check=False)
             if result.returncode == 0 and os.path.isfile(os.path.join(clone_dir, "weld.py")):
                 break
         else:
@@ -4592,7 +4886,7 @@ def cmd_self_upgrade(force: bool = False, yes: bool = False) -> None:
 
     # Verify new binary
     try:
-        result = subprocess.run(
+        result = _run_logged(
             [dest, "--version"],
             capture_output=True, text=True, timeout=10, check=False,
         )
@@ -4659,7 +4953,7 @@ def _preprocess_tool_opt_args(argv: list[str]) -> list[str]:
     return out
 
 
-def main() -> None:
+def _main() -> None:
     bootstrap()
 
     parser = argparse.ArgumentParser(
@@ -4728,110 +5022,130 @@ def main() -> None:
 
     args = parser.parse_args(_preprocess_tool_opt_args(sys.argv[1:]))
 
-    try:
-        # Apply -W/-E tool-option changes first so a combined command
-        # (e.g. `weld --build app -Wruff "--ignore=F401"`) uses them now.
-        handled_tool_opts = _apply_tool_opt_changes("nuitka", args.wnuitka, args.enuitka)
-        handled_tool_opts = (
-            _apply_tool_opt_changes("ruff", args.wruff, args.eruff) or handled_tool_opts
-        )
+    # Apply -W/-E tool-option changes first so a combined command
+    # (e.g. `weld --build app -Wruff "--ignore=F401"`) uses them now.
+    handled_tool_opts = _apply_tool_opt_changes("nuitka", args.wnuitka, args.enuitka)
+    handled_tool_opts = (
+        _apply_tool_opt_changes("ruff", args.wruff, args.eruff) or handled_tool_opts
+    )
 
-        if args.version:
-            _print(f"weld {_CYAN}{_BOLD}{VERSION}{_RESET}")
-        elif args.list or args.list_filter or args.list_sort != "name":
-            cmd_list(sort_by=args.list_sort, filter_pat=args.list_filter)
-        elif args.build is not None:
-            cmd_build(args.build)
-        elif args.install is not None:
-            cmd_install(args.install)
-        elif args.update is not None:
-            cmd_update(args.update)
-        elif args.update_all:
-            cmd_update_all()
-        elif args.new is not None:
-            cmd_new(args.new)
-        elif args.remove is not None:
-            cmd_remove(args.remove)
-        elif args.info is not None:
-            cmd_info(args.info)
-        elif args.run is not None:
-            if not args.run:
-                console.print(
-                    "[red]Error:[/red] --run requires a package name.\n"
-                    "[dim]NOTE: --run must be placed last so arguments are "
-                    "forwarded correctly.  Example: weld --run mypkg --flag[/dim]"
-                )
-                raise SystemExit(1)
-            cmd_run(args.run[0], args.run[1:])
-        elif args.search is not None:
-            cmd_search(args.search)
-        elif args.verify:
-            cmd_verify()
-        elif args.clean:
-            cmd_clean()
-        elif args.addc is not None:
-            cmd_addc(args.addc)
-        elif args.pin is not None:
-            cmd_pin(args.pin)
-        elif args.unpin is not None:
-            cmd_unpin(args.unpin)
-        elif args.note is not None:
-            if len(args.note) < 2:
-                console.print(
-                    "[red]Error:[/red] --note requires a package name and a note. "
-                    "Example: weld --note mypkg 'my note'"
-                )
-                raise SystemExit(1)
-            cmd_note(args.note[0], " ".join(args.note[1:]))
-        elif args.rename is not None:
-            cmd_rename(args.rename[0], args.rename[1])
-        elif args.duplicate is not None:
-            cmd_duplicate(args.duplicate[0], args.duplicate[1])
-        elif args.edit is not None:
-            cmd_edit(args.edit)
-        elif args.history is not None:
-            cmd_history(args.history or None)
-        elif args.stats:
-            cmd_stats()
-        elif args.doctor:
-            cmd_doctor()
-        elif args.template is not None:
-            cmd_template(args.template)
-        elif args.templates:
-            cmd_template_list()
-        elif args.completions is not None:
-            if args.completions == "zsh":
-                cmd_completions_zsh()
-            else:
-                console.print(
-                    f"[red]Error:[/red] Unknown shell '{_esc(args.completions)}' "
-                    "(supported: zsh)"
-                )
-                raise SystemExit(1)
-        elif args.self_upgrade:
-            cmd_self_upgrade(force=args.force, yes=args.yes)
-        elif args.check_update:
-            cmd_check_update()
-        elif handled_tool_opts:
-            pass  # only -W/-E flags were given; the config is already updated
+    if args.version:
+        _print(f"weld {_CYAN}{_BOLD}{VERSION}{_RESET}")
+    elif args.list or args.list_filter or args.list_sort != "name":
+        cmd_list(sort_by=args.list_sort, filter_pat=args.list_filter)
+    elif args.build is not None:
+        cmd_build(args.build)
+    elif args.install is not None:
+        cmd_install(args.install)
+    elif args.update is not None:
+        cmd_update(args.update)
+    elif args.update_all:
+        cmd_update_all()
+    elif args.new is not None:
+        cmd_new(args.new)
+    elif args.remove is not None:
+        cmd_remove(args.remove)
+    elif args.info is not None:
+        cmd_info(args.info)
+    elif args.run is not None:
+        if not args.run:
+            console.print(
+                "[red]Error:[/red] --run requires a package name.\n"
+                "[dim]NOTE: --run must be placed last so arguments are "
+                "forwarded correctly.  Example: weld --run mypkg --flag[/dim]"
+            )
+            raise SystemExit(1)
+        cmd_run(args.run[0], args.run[1:])
+    elif args.search is not None:
+        cmd_search(args.search)
+    elif args.verify:
+        cmd_verify()
+    elif args.clean:
+        cmd_clean()
+    elif args.addc is not None:
+        cmd_addc(args.addc)
+    elif args.pin is not None:
+        cmd_pin(args.pin)
+    elif args.unpin is not None:
+        cmd_unpin(args.unpin)
+    elif args.note is not None:
+        if len(args.note) < 2:
+            console.print(
+                "[red]Error:[/red] --note requires a package name and a note. "
+                "Example: weld --note mypkg 'my note'"
+            )
+            raise SystemExit(1)
+        cmd_note(args.note[0], " ".join(args.note[1:]))
+    elif args.rename is not None:
+        cmd_rename(args.rename[0], args.rename[1])
+    elif args.duplicate is not None:
+        cmd_duplicate(args.duplicate[0], args.duplicate[1])
+    elif args.edit is not None:
+        cmd_edit(args.edit)
+    elif args.history is not None:
+        cmd_history(args.history or None)
+    elif args.stats:
+        cmd_stats()
+    elif args.doctor:
+        cmd_doctor()
+    elif args.template is not None:
+        cmd_template(args.template)
+    elif args.templates:
+        cmd_template_list()
+    elif args.completions is not None:
+        if args.completions == "zsh":
+            cmd_completions_zsh()
         else:
-            parser.print_help()
+            console.print(
+                f"[red]Error:[/red] Unknown shell '{_esc(args.completions)}' "
+                "(supported: zsh)"
+            )
+            raise SystemExit(1)
+    elif args.self_upgrade:
+        cmd_self_upgrade(force=args.force, yes=args.yes)
+    elif args.check_update:
+        cmd_check_update()
+    elif handled_tool_opts:
+        pass  # only -W/-E flags were given; the config is already updated
+    else:
+        parser.print_help()
 
-    except KeyboardInterrupt:
+
+def main() -> None:
+    global _diagnostics
+    previous = _diagnostics
+    session = _DiagnosticSession()
+    stdout, stderr = sys.stdout, sys.stderr
+    _diagnostics = session
+    sys.stdout = _DiagnosticStream(stdout, session, "Console stdout")
+    sys.stderr = _DiagnosticStream(stderr, session, "Console stderr")
+    try:
+        _main()
+    except KeyboardInterrupt as exc:
         _write(_SHOW_CURSOR)
         _print(f"\n{_YELLOW}Aborted.{_RESET}")
-        raise SystemExit(1)
+        _report_error(exc)
+        raise SystemExit(1) from exc
     except BrokenPipeError:
-        # Output was piped into e.g. `head`; exit quietly.
+        # Output was piped into e.g. `head`; exit quietly without an error log.
         try:
-            devnull = os.open(os.devnull, os.O_WRONLY)
-            os.dup2(devnull, sys.stdout.fileno())
+            with open(os.devnull, "w") as devnull:
+                os.dup2(devnull.fileno(), sys.stdout.fileno())
         except OSError:
             pass
         raise SystemExit(0)
-    except OSError as exc:
+    except SystemExit as exc:
+        if exc.code not in (None, 0):
+            _report_error(exc)
+        raise
+    except Exception as exc:
         console.print(f"[red]Error:[/red] {_esc(str(exc))}")
-        raise SystemExit(1)
+        _report_error(exc)
+        raise SystemExit(1) from exc
+    finally:
+        sys.stdout, sys.stderr = stdout, stderr
+        _diagnostics = previous
+        session.close()
 
 
 if __name__ == "__main__":

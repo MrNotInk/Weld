@@ -1199,6 +1199,33 @@ def test_doctor_lists_cli_tools(weld: WeldRunner) -> None:
     for tool in ("git", "gcc", "make", "curl", "wget", "pip", "gh",
                  "cc(python)"):
         assert tool in result.stdout, f"{tool} missing from doctor output"
+    assert "pyinstaller" not in (result.stdout + result.stderr).lower()
+
+
+@pytest.mark.parametrize("compiler", ["nuitka", "pyinstaller"])
+@pytest.mark.parametrize("available", [False, True])
+def test_doctor_does_not_probe_pyinstaller(
+    weld: WeldRunner, compiler: str, available: bool,
+) -> None:
+    weld.ok("--version")  # bootstrap config before changing it
+    weld.set_config(compiler=compiler)
+    pyinstaller = weld.root / "fakebin" / "pyinstaller"
+    marker = weld.root / "pyinstaller-called"
+    if available:
+        _write_exe(
+            pyinstaller,
+            "#!/usr/bin/env python3\n"
+            "from pathlib import Path\n"
+            f"Path({str(marker)!r}).write_text('unexpected invocation')\n"
+            "raise SystemExit(1)\n",
+        )
+    else:
+        pyinstaller.unlink()
+
+    result = weld.ok("--doctor")
+    assert "All required tools are available" in result.stdout
+    assert "pyinstaller" not in (result.stdout + result.stderr).lower()
+    assert not marker.exists()
 
 
 def test_install_libs_missing_c_compiler(weld: WeldRunner) -> None:
