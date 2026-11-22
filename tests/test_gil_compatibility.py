@@ -187,16 +187,22 @@ def test_install_applies_gil_compatibility_only_to_free_threaded_native_apps(
 
     weld_module.bootstrap()
     weld_module._cmd_install(str(archive))
+    # Only the package's own command needs the startup flags; helper scripts
+    # keep their own shebang.
     needs_gil = free_threaded and has_libs
-    expected = DEFAULT_GIL_SHEBANG if needs_gil else b"#!/usr/bin/env python3\n"
-    for name in ("clock", "helper"):
+    expected = {
+        "clock": DEFAULT_GIL_SHEBANG if needs_gil else b"#!/usr/bin/env python3\n",
+        "helper": b"#!/usr/bin/env python3\n",
+    }
+    for name, shebang in expected.items():
         executable = Path(weld_module.WELD_BIN) / name
-        assert executable.read_bytes() == expected + PROBE
+        assert executable.read_bytes() == shebang + PROBE
         direct = subprocess.run(
             [str(executable), "two words"], env=_runtime_env(),
             capture_output=True, text=True, check=True, timeout=10,
         )
-        assert json.loads(direct.stdout)["gil"] == ("1" if needs_gil else None)
+        wants_gil = needs_gil and name == "clock"
+        assert json.loads(direct.stdout)["gil"] == ("1" if wants_gil else None)
         assert json.loads(direct.stdout)["args"] == ["two words"]
 
     # --run must also honor the installed executable's startup flags.
