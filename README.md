@@ -307,6 +307,18 @@ entry:
   package in `~/.weld/Readme/` (and are removed when an archive no longer
   contains them).
 
+## 📚 Documentation
+
+Detailed guides live in [`docs/`](docs/):
+
+| Document | Contents |
+|---|---|
+| [docs/project.md](docs/project.md) | How to lay out a project by hand (`config.json`, `bin/`, `bin/libs/`, Readme/Changelog), building the archive, common mistakes. |
+| [docs/weld.md](docs/weld.md) | How to use Weld: every command, build/install/run, registry installs, `~/.weld` state, error logs, self-upgrade. |
+| [docs/config.md](docs/config.md) | Option reference for `config.json`, `~/.weld/config.toml`, registry `list.json` and `packages.json`. |
+| [docs/plugins.md](docs/plugins.md) | Hook reference, project vs global plugins, examples. |
+| [docs/templates.md](docs/templates.md) | Built-in templates, writing your own, what `--template` changes. |
+
 ## 🧪 Tests
 
 The test-suite runs Weld end-to-end in an isolated `HOME`, executing the
