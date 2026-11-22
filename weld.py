@@ -2,7 +2,6 @@
 import argparse
 import copy
 import fnmatch
-import glob
 import importlib.util
 import json
 import os
@@ -50,7 +49,7 @@ except ImportError:
 
 console = Console()
 
-VERSION = "0.6.2"
+VERSION = "0.6.3"
 
 WELD_DIR       = os.path.expanduser("~/.weld")
 WELD_BIN       = os.path.join(WELD_DIR, "bin")
@@ -96,6 +95,11 @@ _WELD_DIR_KNOWN = {
     "logs", "plugins", "templates",
 }
 
+# Relative paths of the library files copied into ~/.weld/bin/libs. The
+# legacy "libs" list (bare .so module names from Cython builds) is still read
+# for packages installed by older Weld versions.
+_LIB_FILES_KEY = "_lib_files"
+
 # Saved tool options, managed with -Wnuitka / -Enuitka / -Wruff / -Eruff
 # (or by editing config.toml). Legacy Nuitka options are retained but ignored.
 _DEFAULT_NUITKA_OPTS: list[str] = []
@@ -107,7 +111,6 @@ _TOOL_OPT_FLAGS = ("-Wnuitka", "-Enuitka", "-Wruff", "-Eruff")
 DEFAULT_CONFIG = {
     "weld": {
         "compiler":         "nuitka",
-        "libs_compiler":    "cython",
         "default_version":  "1.0.0",
         "auto_pip_install": True,
         "nuitka_opts":      list(_DEFAULT_NUITKA_OPTS),
@@ -1518,14 +1521,6 @@ def get_compiler() -> str:
     return val
 
 
-def get_libs_compiler() -> str:
-    val = str(_weld_settings().get("libs_compiler", "cython")).lower()
-    if val != "cython":
-        _print(f"{_YELLOW}Warning:{_RESET} Unknown libs_compiler '{val}', falling back to cython")
-        return "cython"
-    return val
-
-
 def get_auto_pip_install() -> bool:
     return bool(_weld_settings().get("auto_pip_install", True))
 
@@ -1872,7 +1867,7 @@ def remove_changelog(pkg_name: str, silent: bool = False) -> None:
 
 
 # ---------------------------------------------------------------------------
-# Compilers
+# Script preparation and installed libraries
 # ---------------------------------------------------------------------------
 
 def _gil_enabled_shebang(shebang: bytes) -> bytes:
@@ -1915,8 +1910,8 @@ def compile_py_nuitka(
     source with only the final .py suffix removed. An existing shebang is
     preserved; otherwise /usr/bin/env python3 is used. Execute bits are
     added without changing the other permissions. *enable_gil* adds -X gil=1
-    to the shebang for Cython libraries built on free-threaded Python, without
-    changing the script body or declaring those libraries GIL-independent.
+    to the shebang for installed native libraries on free-threaded Python,
+    without changing the script body or declaring them GIL-independent.
 
     The legacy name, *opts* (ignored), callback, and CompletedProcess return
     value are retained for compatibility. The source is removed only after
@@ -2016,15 +2011,15 @@ def _compile_nuitka_live(
     return result
 
 
-def _find_c_compiler() -> str | None:
+def _find_cc_command() -> str | None:
     """
-    Return the C compiler command that setuptools will use for C builds,
-    or None when it is not installed.
+    Return the C compiler command Python was built with, or None if missing.
 
-    Python's configured compiler (``sysconfig`` CC, e.g. ``gcc-13`` or
-    ``x86_64-linux-gnu-gcc``) takes precedence — when it is not on PATH the
-    build would fail, so it is reported as missing even if another compiler
-    (gcc/clang) happens to be installed.
+    Weld does not compile anything any more, but ``--doctor`` still reports
+    whether this optional toolchain is present. Python's configured compiler
+    (``sysconfig`` CC, e.g. ``gcc-13`` or ``x86_64-linux-gnu-gcc``) takes
+    precedence; when it is not on PATH that is reported even if another
+    compiler (gcc/clang) happens to be installed.
     """
     import sysconfig
 
@@ -2037,80 +2032,55 @@ def _find_c_compiler() -> str | None:
     return None
 
 
-def compile_to_so(python_file: str, inplace: bool = True) -> str:
-    if not os.path.exists(python_file):
-        raise FileNotFoundError(python_file)
-    if not python_file.endswith(".py"):
-        raise ValueError("File must be a .py file")
+def install_libs_as_is(
+    libs_dir: str,
+    target_dir: str | None = None,
+    already_tracked: set[str] | None = None,
+) -> tuple[list[str], list[str]]:
+    """Copy every library in *libs_dir* into the installed libs directory.
 
-    base_name  = os.path.splitext(os.path.basename(python_file))[0]
-    script_dir = os.path.dirname(os.path.abspath(python_file)) or "."
+    Libraries are never compiled: files are copied **unmodified** by default,
+    so ``_clock.py`` stays ``_clock.py`` and existing ``.so`` files, packages
+    and data are kept too. No Cython, setuptools or C compiler is involved, so
+    installing cannot fail with a native build error.
 
-    setup_content = (
-        "from setuptools import setup\n"
-        "from Cython.Build import cythonize\n\n"
-        "setup(\n"
-        f"    ext_modules=cythonize({os.path.basename(python_file)!r},\n"
-        "    compiler_directives={\"language_level\": 3})\n"
-        ")\n"
-    )
+    Returns ``(copied, created)``: absolute paths of every copied file, and
+    the files that may be rolled back if a later installation step fails.
+    Anything already tracked by the installed version (*already_tracked*,
+    relative paths) is never reported as created, so its previous content is
+    kept instead of being deleted.
+    """
+    target_dir = target_dir or WELD_LIBS
+    already_tracked = already_tracked or set()
+    files = _collect_tree_files(libs_dir) if os.path.isdir(libs_dir) else []
+    if not files:
+        return [], []
 
-    # Unique file name so a user module called _setup_compile_tmp.py is
-    # never overwritten.
-    fd, setup_path = tempfile.mkstemp(
-        prefix="_weld_setup_", suffix=".py", dir=script_dir
-    )
-    os.close(fd)
-    _record_diagnostic(
-        f"\nCython source: {os.path.abspath(python_file)}\n"
-        f"Generated setup script: {setup_path}\n--- Setup script contents ---\n{setup_content}\n"
-    )
-
+    os.makedirs(target_dir, exist_ok=True)
+    copied: list[str] = []
+    created: list[str] = []
     try:
-        with open(setup_path, "w", encoding="utf-8") as fp:
-            fp.write(setup_content)
-        cmd = [sys.executable, setup_path, "build_ext"]
-        if inplace:
-            cmd.append("--inplace")
-
-        with spinner(f"Cython  {os.path.basename(python_file)}"):
-            result = _run_logged(
-                cmd, cwd=script_dir, capture_output=True, text=True, check=False
-            )
-            if result.returncode != 0:
-                details = []
-                if result.stdout:
-                    details.append(f"stdout:\n{result.stdout.rstrip()}")
-                if result.stderr:
-                    details.append(f"stderr:\n{result.stderr.rstrip()}")
-                if not details:
-                    details.append("The build process produced no stdout or stderr.")
-                raise RuntimeError(
-                    f"Cython build failed (exit code {result.returncode}):\n" + "\n".join(details)
-                )
-
-            pattern = os.path.join(glob.escape(script_dir), glob.escape(base_name) + ".cpython-*.so")
-            so_files = sorted(glob.glob(pattern))
-            if not so_files:
-                raise RuntimeError("Cython .so was not generated")
-
-            generated_so = so_files[0]
-            final_so     = os.path.join(script_dir, f"{base_name}.so")
-
-            if os.path.abspath(generated_so) != os.path.abspath(final_so):
-                if os.path.exists(final_so):
-                    os.remove(final_so)
-                os.rename(generated_so, final_so)
-
-            c_file = os.path.join(script_dir, f"{base_name}.c")
-            if os.path.exists(c_file):
-                os.remove(c_file)
-
-            return final_so
-
-    finally:
-        if os.path.exists(setup_path):
-            os.remove(setup_path)
+        for relative in files:
+            destination = _safe_join(target_dir, relative)
+            if destination is None:
+                raise RuntimeError(f"Unsafe library path: {relative}")
+            existed = os.path.exists(destination) or relative in already_tracked
+            os.makedirs(os.path.dirname(destination), exist_ok=True)
+            shutil.copy2(os.path.join(libs_dir, relative), destination)
+            copied.append(destination)
+            if not existed:
+                created.append(destination)
+    except BaseException:
+        # Do not leave a partially copied library tree behind. Files that
+        # already existed (or belong to the installed version) are untouched.
+        for destination in created:
+            try:
+                if os.path.isfile(destination):
+                    os.remove(destination)
+            except OSError:
+                pass
+        raise
+    return copied, created
 
 
 # ---------------------------------------------------------------------------
@@ -2346,6 +2316,59 @@ def _copy_tree_tracked(
     return tracked
 
 
+def _collect_tree_files(src_dir: str) -> list[str]:
+    """Return sorted relative paths of the files below *src_dir*.
+
+    Build leftovers and caches are skipped (``build/``, ``__pycache__``,
+    ``*.c``/``*.spec`` ...), matching what an archive may contain. Symlinks
+    are not followed, so a copied library tree never points outside itself.
+    """
+    found: list[str] = []
+    for root, dirs, files in os.walk(src_dir):
+        dirs[:] = sorted(d for d in dirs if not _is_junk_name(d))
+        rel_root = os.path.relpath(root, src_dir)
+        for filename in sorted(files):
+            if _is_junk_name(filename):
+                continue
+            if os.path.islink(os.path.join(root, filename)):
+                continue
+            rel = filename if rel_root == "." else os.path.join(rel_root, filename)
+            found.append(rel)
+    return found
+
+
+def _lib_extras(info: dict) -> list[str]:
+    """Return the library files *info* installed as-is (relative paths)."""
+    if not isinstance(info, dict):
+        return []
+    files = info.get(_LIB_FILES_KEY, [])
+    return [str(name) for name in files] if isinstance(files, list) else []
+
+
+def _lib_display(info: dict) -> list[str]:
+    """Return every installed library of *info*, for tables and --info."""
+    if not isinstance(info, dict):
+        return []
+    return [str(lib) for lib in info.get("libs", [])] + _lib_extras(info)
+
+
+def _lib_ownership(datac: dict, pkg_name: str) -> tuple[set[str], set[str]]:
+    """Return (installed lib paths, library names) owned by other packages.
+
+    ``libs`` holds bare module names from Cython installs made by earlier
+    Weld versions and is still honoured so those shared libraries keep being
+    removed correctly; ``_lib_files`` holds the relative paths copied as-is.
+    """
+    other_files: set[str] = set()
+    other_names: set[str] = set()
+    for other_name, other_info in datac.items():
+        if other_name == pkg_name or not isinstance(other_info, dict):
+            continue
+        other_files.update(_lib_extras(other_info))
+        other_names.update(str(lib) for lib in other_info.get("libs", []))
+    return other_files, other_names
+
+
 # ---------------------------------------------------------------------------
 # Weld_tools registry (list.json) — resolves package names to downloads
 # ---------------------------------------------------------------------------
@@ -2575,12 +2598,11 @@ def _cmd_install(wld_file: str, log_action: bool = True) -> None:
         # Files / libs owned by other packages must never be deleted or
         # considered stale when this package is upgraded.
         other_files: set[str] = set()
-        other_libs: set[str] = set()
         for other_name, other_info in datac.items():
             if other_name == pkg_name:
                 continue
             other_files.update(str(f) for f in other_info.get("files", []))
-            other_libs.update(str(lib) for lib in other_info.get("libs", []))
+        other_lib_files, other_libs = _lib_ownership(datac, pkg_name)
 
     _call_hook(global_plugin, "before_install", config)
 
@@ -2604,9 +2626,8 @@ def _cmd_install(wld_file: str, log_action: bool = True) -> None:
                 f"(auto_pip_install = false){_RESET}"
             )
 
-    compiler      = get_compiler()
-    libs_compiler = get_libs_compiler()
-    nuitka_opts   = get_nuitka_opts() if compiler == "nuitka" else []
+    compiler    = get_compiler()
+    nuitka_opts = get_nuitka_opts() if compiler == "nuitka" else []
 
     with tempfile.TemporaryDirectory(prefix="weld-install-") as tmp:
         with spinner("Extracting wld archive"):
@@ -2626,13 +2647,15 @@ def _cmd_install(wld_file: str, log_action: bool = True) -> None:
         if os.path.isfile(main_src) and os.path.abspath(main_src) != os.path.abspath(main_dst):
             os.replace(main_src, main_dst)
 
-        py_files   = filter_files(tmp_bin, ".py")
-        libs_files = filter_files(tmp_libs, ".py") if os.path.isdir(tmp_libs) else []
+        py_files = filter_files(tmp_bin, ".py")
+        copied_lib_files = (
+            _collect_tree_files(tmp_libs) if os.path.isdir(tmp_libs) else []
+        )
         enable_gil = False
-        if libs_files:
+        if copied_lib_files:
             import sysconfig
-            # Cython modules are not necessarily free-threading safe. Start
-            # with the GIL instead of letting their import enable it noisily.
+            # Native modules may not be free-threading safe. Start with the
+            # GIL instead of letting their import enable it noisily.
             enable_gil = sysconfig.get_config_var("Py_GIL_DISABLED") == 1
 
         if py_files:
@@ -2680,68 +2703,17 @@ def _cmd_install(wld_file: str, log_action: bool = True) -> None:
         for cache in ("__pycache__", ".mypy_cache", ".ruff_cache"):
             shutil.rmtree(os.path.join(tmp_bin, cache), ignore_errors=True)
 
-        compiled_libs: list[str] = []
-        if libs_files:
-            _print(f"\n{_BOLD}{_CYAN}Compiling libs with {libs_compiler}...{_RESET}")
-            if importlib.util.find_spec("Cython") is None:
-                console.print(
-                    "[red]Error:[/red] Cython is not installed. "
-                    "Install it with: pip install cython"
-                )
-                raise SystemExit(1)
-            if importlib.util.find_spec("setuptools") is None:
-                console.print(
-                    "[red]Error:[/red] setuptools is not installed. "
-                    "Install it with: pip install setuptools"
-                )
-                raise SystemExit(1)
-            if _find_c_compiler() is None:
-                import sysconfig
-                expected = (sysconfig.get_config_var("CC") or "").strip().split()
-                expected_cc = expected[0] if expected else ""
-                if expected_cc:
-                    console.print(
-                        f"[red]Error:[/red] C compiler "
-                        f"'{_esc(expected_cc)}' not found."
-                    )
-                    _print(
-                        f"{_DIM}Python was built expecting '{expected_cc}'. "
-                        f"Install it with: sudo apt install {expected_cc} "
-                        f"(or build-essential){_RESET}"
-                    )
-                else:
-                    console.print(
-                        "[red]Error:[/red] No C compiler found "
-                        "(checked: gcc, cc, clang)."
-                    )
-                    _print(
-                        f"{_DIM}Install one with: sudo apt install "
-                        f"build-essential{_RESET}"
-                    )
-                raise SystemExit(1)
-            try:
-                for idx, py_file in enumerate(libs_files, 1):
-                    full = os.path.join(tmp_libs, py_file)
-                    _progress(idx, len(libs_files), py_file)
-                    try:
-                        so_path = compile_to_so(full)
-                    except (RuntimeError, OSError, ValueError) as exc:
-                        console.print(
-                            f"[red]Error:[/red] Cython failed for libs/{_esc(py_file)}"
-                        )
-                        _print(str(exc))
-                        _print(
-                            f"{_DIM}Hint: a Cython build needs a C compiler "
-                            f"(gcc) and Python headers (python3-dev).{_RESET}"
-                        )
-                        raise SystemExit(1)
-                    compiled_libs.append(os.path.basename(so_path).removesuffix(".so"))
-                    if os.path.exists(full):
-                        os.remove(full)
-            finally:
-                _progress_done()
-            for cache in ("__pycache__", "build", ".mypy_cache", ".ruff_cache"):
-                shutil.rmtree(os.path.join(tmp_libs, cache), ignore_errors=True)
+        if copied_lib_files:
+            # Libraries are installed as-is: no cythonize step, C compiler or
+            # native build (legacy libs_compiler = "cython" setting). Packages
+            # with bin/libs/*.py therefore work on any Python that can import
+            # them, including interpreters and platforms where a Cython build
+            # would fail (e.g. unsupported 3.15 pre-releases).
+            _print(
+                f"\n{_BOLD}{_CYAN}Copying libs..."
+                f"{_RESET} {_DIM}({len(copied_lib_files)} file(s) as-is)"
+                f"{_RESET}"
+            )
 
         # Everything left in bin/ (except libs/ and junk) is an installable
         # artifact: an executable script/binary or a data file/directory.
@@ -2755,7 +2727,8 @@ def _cmd_install(wld_file: str, log_action: bool = True) -> None:
             artifacts.append(entry)
 
         created_files: list[str] = []
-        created_libs: list[str] = []
+        created_lib_files: list[str] = []
+        copied_lib_rel: list[str] = []
         installed_files: list[str] = []
 
         try:
@@ -2775,13 +2748,12 @@ def _cmd_install(wld_file: str, log_action: bool = True) -> None:
                     if entry in binary_names and compiler == "pyinstaller":
                         os.chmod(dst, 0o755)
 
-            for lib in compiled_libs:
-                src = os.path.join(tmp_libs, f"{lib}.so")
-                dst = os.path.join(WELD_LIBS, f"{lib}.so")
-                existed = os.path.exists(dst)
-                shutil.copy2(src, dst)
-                if not existed:
-                    created_libs.append(dst)
+            copied_lib_files, created_lib_files = install_libs_as_is(
+                tmp_libs, WELD_LIBS, set(_lib_extras(old_info)) if old_info else set(),
+            )
+            copied_lib_rel = [
+                os.path.relpath(path, WELD_LIBS) for path in copied_lib_files
+            ]
 
             has_readme    = store_readme(pkg_name, tmp)
             has_changelog = store_changelog(pkg_name, tmp)
@@ -2799,7 +2771,7 @@ def _cmd_install(wld_file: str, log_action: bool = True) -> None:
                     "version":       version,
                     "desc":          desc,
                     "files":         sorted(installed_files),
-                    "libs":          sorted(compiled_libs),
+                    _LIB_FILES_KEY:  sorted(copied_lib_rel),
                     "has_readme":    has_readme,
                     "has_changelog": has_changelog,
                     "pinned":        datac[pkg_name].get("pinned", False) if already else False,
@@ -2812,7 +2784,6 @@ def _cmd_install(wld_file: str, log_action: bool = True) -> None:
             # Roll back files that did not exist before this install. Files
             # belonging to a previously installed version are left in place.
             old_files = set(old_info.get("files", [])) if old_info else set()
-            old_libs  = set(old_info.get("libs",  [])) if old_info else set()
             for path in created_files:
                 rel = os.path.relpath(path, WELD_BIN)
                 if rel in old_files:
@@ -2823,10 +2794,7 @@ def _cmd_install(wld_file: str, log_action: bool = True) -> None:
                         _prune_empty_dirs(WELD_BIN, rel)
                 except OSError:
                     pass
-            for path in created_libs:
-                lib = os.path.basename(path).removesuffix(".so")
-                if lib in old_libs:
-                    continue
+            for path in created_lib_files:
                 try:
                     if os.path.isfile(path):
                         os.remove(path)
@@ -2848,9 +2816,18 @@ def _cmd_install(wld_file: str, log_action: bool = True) -> None:
                     except OSError:
                         pass
             for lib in old_info.get("libs", []):
-                if lib in other_libs or lib in compiled_libs:
+                if lib in other_libs:
                     continue
                 target = _safe_join(WELD_LIBS, f"{lib}.so")
+                if target and os.path.isfile(target):
+                    try:
+                        os.remove(target)
+                    except OSError:
+                        pass
+            for rel in _lib_extras(old_info):
+                if rel in other_lib_files or rel in copied_lib_rel:
+                    continue
+                target = _safe_join(WELD_LIBS, rel)
                 if target and os.path.isfile(target):
                     try:
                         os.remove(target)
@@ -3096,7 +3073,7 @@ def cmd_info(pkg_name: str) -> None:
     info  = datac[pkg_name]
     deps  = info.get("deps",  [])
     files = info.get("files", [])
-    libs  = info.get("libs",  [])
+    libs  = _lib_display(info)
     pin   = f"  {_YELLOW}[PINNED]{_RESET}" if info.get("pinned") else ""
 
     _print(f"\n{_BOLD}{_CYAN}📦 {pkg_name}{_RESET}{pin}")
@@ -3218,7 +3195,7 @@ def cmd_list(sort_by: str = "name", filter_pat: str = "") -> None:
     for idx, (name, info) in enumerate(packages.items(), 1):
         deps  = info.get("deps",  [])
         files = info.get("files", [])
-        libs  = info.get("libs",  [])
+        libs  = _lib_display(info)
         table.add_row(
             str(idx), _esc(name),
             _esc(str(info.get("version", "N/A"))),
@@ -3263,12 +3240,11 @@ def cmd_remove(pkg_name: str, silent: bool = False) -> None:
         # Never delete files or libs that another package still references
         # (duplicated packages share binaries/data/libs).
         other_files: set[str] = set()
-        other_libs: set[str] = set()
         for other_name, other_info in datac.items():
             if other_name == pkg_name:
                 continue
             other_files.update(str(f) for f in other_info.get("files", []))
-            other_libs.update(str(lib) for lib in other_info.get("libs", []))
+        other_lib_files, other_libs = _lib_ownership(datac, pkg_name)
 
         for rel in datac[pkg_name].get("files", []):
             rel = str(rel)
@@ -3284,17 +3260,22 @@ def cmd_remove(pkg_name: str, silent: bool = False) -> None:
                 if not silent:
                     _print(f"{_YELLOW}Removed:{_RESET} {path}")
 
-        for lib in datac[pkg_name].get("libs", []):
-            lib = str(lib)
-            if lib in other_libs:
+        pkg_info = datac[pkg_name] if isinstance(datac[pkg_name], dict) else {}
+        installed_libs = [
+            f"{lib}.so" for lib in pkg_info.get("libs", [])
+        ] + _lib_extras(pkg_info)
+        for rel in installed_libs:
+            if rel in other_lib_files:
                 continue
-            path = _safe_join(WELD_LIBS, f"{lib}.so")
+            if rel.endswith(".so") and rel[:-3] in other_libs:
+                continue
+            path = _safe_join(WELD_LIBS, rel)
             if path is None:
-                _print(f"{_YELLOW}Warning:{_RESET} Skipping unsafe lib path '{lib}'")
+                _print(f"{_YELLOW}Warning:{_RESET} Skipping unsafe lib path '{rel}'")
                 continue
             if os.path.isfile(path) or os.path.islink(path):
                 os.remove(path)
-                _prune_empty_dirs(WELD_BIN, rel)
+                _prune_empty_dirs(WELD_LIBS, rel)
                 if not silent:
                     _print(f"{_YELLOW}Removed:{_RESET} {path}")
 
@@ -3573,7 +3554,7 @@ def cmd_stats() -> None:
     pinned       = sum(1 for p in packages.values() if p.get("pinned"))
     with_notes   = sum(1 for p in packages.values() if p.get("note", "").strip())
     total_files  = sum(len(p.get("files", [])) for p in packages.values())
-    total_libs   = sum(len(p.get("libs",  [])) for p in packages.values())
+    total_libs   = sum(len(_lib_display(p)) for p in packages.values())
     total_deps   = sum(len(p.get("deps",  [])) for p in packages.values())
     last_install = max(
         (p.get("updated_at") or p.get("installed_at") or "" for p in packages.values()),
@@ -3599,7 +3580,7 @@ def cmd_stats() -> None:
     table.add_row("Last activity",       last_install)
     table.add_row("Templates available", str(n_templates))
     table.add_row("Compiler",            cfg.get("compiler",      "nuitka"))
-    table.add_row("Libs compiler",       cfg.get("libs_compiler", "cython"))
+    table.add_row("Library install",     "copy as-is (no compilation)")
     table.add_row("Nuitka options (ignored)", shlex.join(get_nuitka_opts()) or "-")
     table.add_row("Ruff options",        shlex.join(get_ruff_opts()) or "-")
     table.add_row("weld version",         VERSION)
@@ -3614,20 +3595,17 @@ def cmd_stats() -> None:
 
 
 def cmd_doctor() -> None:
-    libs_compiler = get_libs_compiler()
-
     # (tool, version command, required?)
     tools = [
         ("python",      [sys.executable,  "--version"], True),
         ("ruff",        ["ruff",          "--version"], True),
-        ("cython",      ["cython",        "--version"], False),
         ("setuptools",  [sys.executable,  "-c", "import setuptools"], False),
         ("mypy",        ["mypy",          "--version"], False),
         ("uv",          ["uv",            "--version"], False),
         ("zip",         ["zip",           "--version"], False),
         ("unzip",       ["unzip",         "--version"], False),
         ("git",         ["git",           "--version"], True),
-        ("gcc",         ["gcc",           "--version"], libs_compiler == "cython"),
+        ("gcc",         ["gcc",           "--version"], False),
         ("make",        ["make",          "--version"], False),
         ("curl",        ["curl",          "--version"], False),
         ("wget",        ["wget",          "--version"], False),
@@ -3667,11 +3645,11 @@ def cmd_doctor() -> None:
                 rows.append((name, "-", f"{exc} (optional)", "no"))
 
     # C compiler that Python itself was built with (sysconfig CC, e.g.
-    # 'gcc-13' or 'x86_64-linux-gnu-gcc') — this is what setuptools/Cython
-    # invoke, so it matters even when plain gcc is installed under another
-    # name.
+    # 'gcc-13' or 'x86_64-linux-gnu-gcc'). Nothing is compiled by default, so
+    # this row is informational even when plain gcc is installed under
+    # another name.
     import sysconfig
-    cc = _find_c_compiler()
+    cc = _find_cc_command()
     expected = (sysconfig.get_config_var("CC") or "").strip().split()
     expected_cc = expected[0] if expected else ""
     if cc:
@@ -3742,13 +3720,6 @@ def cmd_doctor() -> None:
             f"{', '.join(missing_required)}"
         )
         _print(f"{_DIM}Install everything with: pip install -r requirements.txt{_RESET}")
-    elif libs_compiler == "cython" and not any(
-        row[0] == "cython" and row[1] == "✔" for row in rows
-    ):
-        _print(
-            f"{_YELLOW}Warning:{_RESET} 'cython' is not available; packages that "
-            "ship bin/libs/*.py cannot be installed."
-        )
 
     if all_ok:
         _print(f"{_GREEN}{_BOLD}✔ All required tools are available.{_RESET}")
@@ -3771,6 +3742,7 @@ def cmd_clean() -> None:
             known_bin_entries.add(str(tracked).replace("\\", "/").split("/")[0])
         for lib in info.get("libs", []):
             known_lib_names.add(f"{lib}.so")
+        known_lib_names.update(_lib_extras(info))
 
     _JUNK_DIRS = {"__pycache__", ".mypy_cache", ".ruff_cache", ".pytest_cache", "build"}
     _JUNK_EXTS = {".c", ".spec"}
@@ -3948,10 +3920,13 @@ def cmd_verify() -> None:
                 missing.append(f"bin/{f}")
             elif str(f) == pkg_name and not os.access(path, os.X_OK):
                 missing.append(f"bin/{f} (not executable)")
-        for lib in info.get("libs", []):
-            path = _safe_join(WELD_LIBS, f"{lib}.so")
+        lib_files = _lib_extras(info)
+        for lib_file in lib_files or [
+            f"{lib}.so" for lib in info.get("libs", [])
+        ]:
+            path = _safe_join(WELD_LIBS, lib_file)
             if path is None or not os.path.exists(path):
-                missing.append(f"bin/libs/{lib}.so")
+                missing.append(f"bin/libs/{lib_file}")
         results[pkg_name] = {
             "ok":      len(missing) == 0,
             "missing": missing,
@@ -4001,8 +3976,11 @@ def cmd_addc(pkg_name: str) -> None:
     if pkg_name not in datac:
         console.print(f"[red]Error:[/red] Package '{_esc(pkg_name)}' not found")
         raise SystemExit(1)
-    libs = datac[pkg_name].get("libs", [])
-    if not libs:
+    info = datac[pkg_name]
+    lib_files = _lib_extras(info) or [
+        f"{lib}.so" for lib in info.get("libs", [])
+    ]
+    if not lib_files:
         console.print(f"[yellow]Warning:[/yellow] Package '{_esc(pkg_name)}' has no libs")
         raise SystemExit(1)
     if not os.path.isfile("config.json"):
@@ -4010,19 +3988,26 @@ def cmd_addc(pkg_name: str) -> None:
         raise SystemExit(1)
     os.makedirs(os.path.join("bin", "libs"), exist_ok=True)
     copied = 0
-    for lib in libs:
-        src_path = _safe_join(WELD_LIBS, f"{lib}.so")
-        dst_path = _safe_join(os.path.join("bin", "libs"), f"{lib}.so")
+    for lib_file in lib_files:
+        src_path = _safe_join(WELD_LIBS, lib_file)
+        dst_path = _safe_join(os.path.join("bin", "libs"), lib_file)
         if src_path is None or dst_path is None:
-            console.print(f"[red]Error:[/red] Invalid library name '{_esc(lib)}'")
+            console.print(
+                f"[red]Error:[/red] Invalid library name '{_esc(lib_file)}'"
+            )
             raise SystemExit(1)
         if not os.path.isfile(src_path):
-            console.print(f"[red]Error:[/red] {_esc(lib)}.so not found in installed package")
+            console.print(
+                f"[red]Error:[/red] {_esc(lib_file)} not found in installed package"
+            )
             raise SystemExit(1)
-        with spinner(f"Copying {lib}.so -> bin/libs/"):
+        os.makedirs(os.path.dirname(dst_path), exist_ok=True)
+        with spinner(f"Copying {lib_file} -> bin/libs/"):
             shutil.copy2(src_path, dst_path)
         copied += 1
-    _print(f"{_GREEN}✔{_RESET} Copied {copied} lib(s) into bin/libs/")
+    console.print(
+        f"[green]✔[/green] Copied {copied} lib file(s) into bin/libs/"
+    )
 
 
 def cmd_completions_zsh() -> None:

@@ -126,107 +126,74 @@ def test_success_and_help_do_not_leave_error_logs(
     assert weld_module._diagnostics is None
 
 
-@pytest.mark.parametrize("mode", ["stdout-only", "both-streams", "silent", "missing-so"])
-def test_cython_failure_keeps_all_build_details_after_temporary_files_are_removed(
+def test_lib_copy_failure_is_logged_and_leaves_the_old_version_intact(
     weld_module: ModuleType, tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
-    capsys: pytest.CaptureFixture[str], mode: str,
+    capsys: pytest.CaptureFixture[str],
 ) -> None:
     archive = tmp_path / "clock.wld"
     with zipfile.ZipFile(archive, "w") as zf:
         zf.writestr("config.json", json.dumps({"name": "clock", "version": "1.1.1"}))
         zf.writestr("bin/main.py", "print('clock')\n")
-        zf.writestr("bin/libs/_clock.py", "def now(): return '12:34'\n")
+        zf.writestr("bin/libs/_clock.py", "def now(): return 'new'\n")
+        zf.writestr("bin/libs/0bad.py", "VALUE = 'bad'\n")
     weld_module.bootstrap()
     old_script = Path(weld_module.WELD_BIN) / "clock"
-    old_library = Path(weld_module.WELD_LIBS) / "_clock.so"
+    old_library = Path(weld_module.WELD_LIBS) / "_clock.py"
     old_script.write_text("old executable", encoding="utf-8")
-    old_library.write_bytes(b"old library")
-    old_packages = {"clock": {"version": "1.0.0", "files": ["clock"], "libs": ["_clock"]}}
+    old_library.write_text("old library", encoding="utf-8")
+    old_packages = {
+        "clock": {"version": "1.0.0", "files": ["clock"], "_lib_files": ["_clock.py"]},
+    }
     weld_module.save_packages(old_packages)
-    stdout = "stdout START\n" + "x" * 20_000 + "\nstdout END\n" if mode != "silent" else ""
-    stderr = "stderr START\n" + "y" * 20_000 + "\nstderr END\n" if mode == "both-streams" else ""
-    exit_code = 0 if mode == "missing-so" else 7
-    calls = []
 
-    def build(cmd, **kwargs):
-        calls.append((cmd, kwargs))
-        assert cmd[0] == sys.executable
-        assert "build_ext" in cmd and "--inplace" in cmd
-        assert "from Cython.Build import cythonize" in Path(cmd[1]).read_text(encoding="utf-8")
-        return subprocess.CompletedProcess(cmd, exit_code, stdout=stdout, stderr=stderr)
+    real_copy = weld_module.shutil.copy2
 
-    monkeypatch.setattr(weld_module.subprocess, "run", build)
-    monkeypatch.setattr(weld_module, "_find_c_compiler", lambda: "fake-cc")
+    def copy(source, destination, *args, **kwargs):
+        if str(destination).endswith("0bad.py"):
+            raise OSError("library copy exploded")
+        return real_copy(source, destination, *args, **kwargs)
+
+    monkeypatch.setattr(weld_module.shutil, "copy2", copy)
     _invoke(weld_module, monkeypatch, "--install", str(archive))
     _, report = _report(weld_module)
-    assert len(calls) == 1  # Collecting diagnostics must not run additional tools.
-    cmd, kwargs = calls[0]
-    assert f"Command: {sys.executable}" in report
-    assert f"Working directory: {kwargs['cwd']}" in report
-    assert f"Return code: {exit_code}" in report
-    assert "Generated setup script:" in report
-    assert "compiler_directives={\"language_level\": 3}" in report
     assert "Package configuration:" in report and '"version": "1.1.1"' in report
-    assert not Path(cmd[1]).exists()
-    assert not Path(kwargs["cwd"]).exists()
-    if stdout:
-        assert stdout in report
-    if stderr:
-        assert stderr in report
-    output = capsys.readouterr()
-    plain_output = weld_module._ANSI_ESCAPE_RE.sub("", output.out).replace("\r", "\n")
-    assert "✘ Cython  _clock.py" in plain_output
-    assert "✔ Cython  _clock.py" not in plain_output
-    assert "{_RESET}" not in plain_output
-    assert "Cython .so was not generated" in report if mode == "missing-so" else "exit code 7" in report
-    if mode == "silent":
-        assert "produced no stdout or stderr" in plain_output
-    elif mode == "stdout-only":
-        assert "stdout START" in plain_output and "stdout END" in plain_output
-    assert old_script.read_text(encoding="utf-8") == "old executable"
-    assert old_library.read_bytes() == b"old library"
+    assert "library copy exploded" in report
+    assert "OSError" in report
+    assert "Generated setup script:" not in report
+    plain_output = weld_module._ANSI_ESCAPE_RE.sub("", capsys.readouterr().out)
+    assert "library copy exploded" in plain_output.replace("\r", "\n")
+    # Nothing was compiled: the partially copied library tree is rolled back
+    # and the package database still describes the previous version.
+    assert old_script.is_file()
+    assert old_library.read_text(encoding="utf-8") == "old library"
+    assert not (Path(weld_module.WELD_LIBS) / "0bad.py").exists()
     assert weld_module.load_packages() == old_packages
 
 
-def test_real_cython_parser_failure_is_logged_without_invoking_a_c_compiler(
-    weld_module: ModuleType, tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    archive = tmp_path / "broken.wld"
-    with zipfile.ZipFile(archive, "w") as zf:
-        zf.writestr("config.json", json.dumps({"name": "broken", "version": "1.0.0"}))
-        zf.writestr("bin/main.py", "print('hello')\n")
-        # Cython must reject this before invoking any C compiler.
-        zf.writestr("bin/libs/_broken.py", "def invalid(:\n")
-    monkeypatch.setattr(weld_module, "_find_c_compiler", lambda: "not-needed-for-parsing")
-    _invoke(weld_module, monkeypatch, "--install", str(archive))
-    _, report = _report(weld_module)
-    assert "Error compiling Cython file:" in report
-    assert "CompileError" in report and "_broken.py" in report
-    assert "Return code: 1" in report
-    assert "Generated setup script:" in report
-    assert weld_module.load_packages() == {}
-
-
-def test_successful_cython_build_discards_its_journal_and_cleans_setup_files(
+def test_libs_are_copied_as_is_without_running_any_build_command(
     weld_module: ModuleType, tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
     capsys: pytest.CaptureFixture[str],
 ) -> None:
-    source = tmp_path / "_native.py"
-    source.write_text("def answer(): return 42\n", encoding="utf-8")
+    archive = tmp_path / "clock.wld"
+    with zipfile.ZipFile(archive, "w") as zf:
+        zf.writestr("config.json", json.dumps({"name": "clock", "version": "1.1.1"}))
+        zf.writestr("bin/main.py", "from libs import _clock\nprint(_clock.now())\n")
+        zf.writestr("bin/libs/_clock.py", "def now(): return '12:34'\n")
+    commands = []
 
-    def build(cmd, **kwargs):
-        source.with_suffix(".cpython-test.so").write_bytes(b"compiled library")
-        source.with_suffix(".c").write_text("generated C", encoding="utf-8")
-        return subprocess.CompletedProcess(cmd, 0, stdout="successful build", stderr="")
+    def run(cmd, **kwargs):
+        commands.append(cmd)
+        raise AssertionError(f"unexpected external command: {cmd}")
 
-    monkeypatch.setattr(weld_module.subprocess, "run", build)
-    monkeypatch.setattr(weld_module, "_main", lambda: weld_module.compile_to_so(str(source)))
-    _invoke(weld_module, monkeypatch, code=None)
-    assert source.with_suffix(".so").read_bytes() == b"compiled library"
-    assert not source.with_suffix(".c").exists()
-    assert not list(tmp_path.glob("_weld_setup_*.py"))
+    monkeypatch.setattr(weld_module.subprocess, "run", run)
+    _invoke(weld_module, monkeypatch, "--install", str(archive), code=None)
+    assert commands == []
+    assert (Path(weld_module.WELD_LIBS) / "_clock.py").read_text(
+        encoding="utf-8"
+    ) == "def now(): return '12:34'\n"
+    assert weld_module.load_packages()["clock"]["_lib_files"] == ["_clock.py"]
     assert _reports(weld_module) == []
-    assert "✔" in capsys.readouterr().out
+    assert "Copying libs" in capsys.readouterr().out
 
 
 @pytest.mark.parametrize("failure", ["launch", "timeout", "check"])

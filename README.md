@@ -13,7 +13,7 @@ A fast, lightweight Python application packaging and distribution tool designed 
 * **Project Scaffolding**: Quickly create new project structures with ready-to-use templates (Flask, FastAPI, CLI, Daemon, TUI, Scraper, etc.).
 * **Code Validation**: Runs `ruff` checks and bytecode compilation (`py_compile`) before building.
 * **Executable Python Scripts**: The default (legacy `nuitka`) mode removes `.py`, ensures a shebang, and adds execute permissions without invoking Nuitka.
-* **Optional Compilation Engines**: Builds native executables using **PyInstaller**, and shared library modules (`.so`) using **Cython**.
+* **Libraries Installed As-Is**: `bin/libs/` is copied verbatim into `~/.weld/bin/libs/` (no Cython, C compiler, or build step), exactly like script mode. Native PyInstaller builds stay optional.
 * **Custom Tool Options**: Add or remove saved Ruff options with `-Wruff` / `-Eruff` (e.g. `weld -Wruff "--ignore=F401"`). Legacy Nuitka option flags remain accepted but are ignored.
 * **Package Archives (`.wld`)**: Archives your Python binaries, libraries, configurations, Readmes, and Changelogs into portable `.wld` files.
 * **Dependency Management**: Automatically manages and installs PyPI dependencies via `uv` or `pip` (can be disabled with `auto_pip_install = false`).
@@ -33,8 +33,10 @@ A fast, lightweight Python application packaging and distribution tool designed 
   [PyInstaller](https://pyinstaller.org/) is only needed when
   `compiler = "pyinstaller"` is selected. Its support for new Python releases
   may lag; Python 3.11–3.13 are recommended for that mode.
-* Cython, a C toolchain, and Python development headers (e.g. `python3-dev`
-  on Debian/Ubuntu) are only needed for projects shipping `bin/libs/*.py`.
+* **No compilers, Cython, or Python headers are needed for libraries.**
+  Packages that ship `bin/libs/*.py` are installed by copying those files;
+  nothing is cythonized, so this works on every Python that can import them
+  (including new pre-releases where Cython/C builds may crash).
 
 ### Installation
 
@@ -49,8 +51,8 @@ python weld.py --doctor
 ```
 
 `requirements.txt` installs the runtime dependencies (`rich`, `tomli-w`),
-the validator (`ruff`), and optional native build support (`cython`,
-`setuptools`, `pyinstaller`). Nuitka is not needed or installed.
+the validator (`ruff`), and optional native build support (`pyinstaller`).
+Nuitka, Cython, and setuptools are not needed: libraries are copied as-is.
 
 ### Updating Weld
 
@@ -85,7 +87,6 @@ Weld stores its state in `~/.weld/` and reads `~/.weld/config.toml`:
 ```toml
 [weld]
 compiler = "nuitka"        # legacy name: Python scripts; or "pyinstaller"
-libs_compiler = "cython"   # only "cython" is currently supported
 default_version = "1.0.0"
 auto_pip_install = true    # install a package's deps on `weld --install`
 nuitka_opts = []           # legacy setting, saved but ignored
@@ -95,7 +96,9 @@ ruff_opts = ["--no-cache", "--output-format=concise"]  # `ruff check` options
 Run `weld --doctor` at any time to check which tools are available. Optional
 tools are labelled accordingly. PyInstaller is not probed or listed by doctor;
 its availability is still checked during installation when
-`compiler = "pyinstaller"` is selected.
+`compiler = "pyinstaller"` is selected. Cython and setuptools are no longer
+probed or required because libraries are copied instead of compiled. The
+legacy `libs_compiler = "cython"` setting is still accepted and ignored.
 
 #### Detailed error logs
 
@@ -110,9 +113,8 @@ console output, and **untruncated stdout and stderr from captured subprocesses**
 (including successful steps and fallback attempts). Python's executable,
 version, virtual environment, ABI/GIL settings, C compiler configuration,
 tool paths, build-package versions, Weld settings, and relevant build
-environment variables are included. Cython reports also retain the generated
-setup script before temporary build files are removed; errors printed only
-to stdout are no longer lost.
+environment variables are included. Errors printed only to stdout are no
+longer lost.
 
 Logs are created with owner-only file permissions. The environment is limited
 to a build-related allowlist, not dumped wholesale, but commands and tool output
@@ -138,15 +140,33 @@ archives and project files are not changed; preparation happens in a temporary
 directory. Existing extensionless files are not overwritten by preparation.
 Choose `compiler = "pyinstaller"` if you need native executable builds instead.
 
-#### Free-threaded Python and Cython libraries
+#### Libraries are copied, not compiled
+
+Everything in an archive's `bin/libs/` is copied unmodified into
+`~/.weld/bin/libs/`, with the same relative layout (`_clock.py`, prebuilt
+`.so` files, packages and data directories stay as they are). This is the
+same approach as executable script mode:
+
+* No Cython, setuptools, C compiler, or Python development headers are used,
+  so installation cannot die in a native build (for example the Cython
+  segfault seen on CPython 3.15 pre-releases).
+* Modified files are replaced on `--update`; files that are no longer shipped
+  are removed, unless another installed package still owns them.
+* All copied files are tracked in `~/.weld/packages.json` under `_lib_files`,
+  so `--verify`, `--remove`, `--clean`, `--addc`, and `--update` keep working.
+* Native extensions that were already built for the running interpreter (for
+  example `_clock.cpython-315-x86_64-linux-gnu.so`) are still copied; ones
+  built for a different Python cannot be fixed by copying.
+
+#### Free-threaded Python and native libraries
 
 When Weld runs on a free-threaded CPython build and an application ships
-`bin/libs/*.py`, its executable scripts start Python with `-X gil=1`. The GIL
-is enabled before Cython extensions are imported, avoiding the warning about
-modules such as `libs._clock` enabling it automatically. This does **not**
-declare arbitrary extensions safe to run without the GIL or suppress other
-runtime warnings. Pure-Python apps and normal GIL builds keep their existing
-startup behavior.
+`bin/libs/`, its executable scripts start Python with `-X gil=1`. The GIL is
+enabled before native modules are imported, avoiding the warning about modules
+such as `libs._clock` enabling it automatically. This does **not** declare
+arbitrary extensions safe to run without the GIL or suppress other runtime
+warnings. Pure-Python apps and normal GIL builds keep their existing startup
+behavior.
 
 These shebangs use `env -S` (available on modern Linux and macOS) to preserve
 the interpreter command and options. After updating Weld, reinstall an affected
@@ -253,7 +273,7 @@ entry:
 The test-suite runs Weld end-to-end in an isolated `HOME`, executing the
 installed Python scripts directly and using a fake PyInstaller shim for
 native build tests. It never touches your real `~/.weld` and does not need
-Nuitka or a C toolchain.
+Nuitka, Cython, setuptools, or a C toolchain.
 
 ```bash
 pip install -r requirements-dev.txt

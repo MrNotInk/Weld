@@ -1228,21 +1228,203 @@ def test_doctor_does_not_probe_pyinstaller(
     assert not marker.exists()
 
 
-def test_install_libs_missing_c_compiler(weld: WeldRunner) -> None:
+def test_install_libs_needs_no_c_compiler(weld: WeldRunner) -> None:
     archive = make_archive(
         weld.root / "clock.wld",
         {"name": "clock", "version": "1.0.0", "deps": [], "desc": "clock"},
-        {"bin/main.py": "print('hi')\n", "bin/libs/helper.py": "x = 1\n"},
+        {
+            "bin/main.py": "from libs import helper\n\nprint(helper.x)\n",
+            "bin/libs/helper.py": "x = 'copied'\n",
+        },
     )
-    # PATH without /usr/bin: no C compiler is visible. Script preparation
-    # itself does not need Nuitka or a native toolchain.
-    result = weld.fail(
-        "--install", str(archive),
+    # PATH without /usr/bin: no C compiler, Cython or setuptools is visible.
+    # Libraries are copied verbatim, so the install still succeeds.
+    result = weld.install(
+        archive,
         path=f"{weld.root / 'fakebin'}:{VENV_BIN}",
     )
-    assert "C compiler" in result.stdout
-    assert "not found" in result.stdout
-    assert "sudo apt install" in result.stdout
+    assert "Copying libs" in result.stdout
+    assert "C compiler" not in result.stdout
 
-    assert weld.packages() == {}
-    assert not (weld.bin_dir / "clock").exists()
+    assert (weld.libs_dir / "helper.py").read_text(encoding="utf-8") == "x = 'copied'\n"
+    assert weld.packages()["clock"]["_lib_files"] == ["helper.py"]
+    assert weld.ok("--run", "clock").stdout.strip() == "copied"
+
+
+# ---------------------------------------------------------------------------
+# libs are installed as-is: no Cython, setuptools or C compiler on PATH
+# ---------------------------------------------------------------------------
+
+def test_install_copies_libs_without_compiling(
+    weld: WeldRunner, tmp_path: Path,
+) -> None:
+    archive = make_archive(
+        weld.root / "clock.wld",
+        {"name": "clock", "version": "1.1.1", "deps": [], "desc": "clock"},
+        {
+            "bin/main.py": (
+                "from libs import _clock\n\n"
+                "print(_clock.now())\n"
+            ),
+            "bin/libs/_clock.py": "def now():\n    return '9:44:22'\n",
+            "bin/libs/native.cpython-315-x86_64-linux-gnu.so": b"prebuilt",
+            "bin/libs/nested/helper.py": "VALUE = 'nested'\n",
+            "bin/libs/build/leftover.c": "junk",
+        },
+    )
+    # Only ruff is available: no cython, setuptools or C compiler anywhere.
+    tools = tmp_path / "libbin"
+    tools.mkdir()
+    _write_exe(tools / "ruff", "#!/bin/sh\nexit 0\n")
+    result = weld.install(archive, path=f"{tools}:/usr/bin:/bin")
+
+    assert "Copying libs" in result.stdout
+    assert "Cython" not in result.stdout
+    assert "C compiler" not in result.stdout
+
+    libs = weld.libs_dir
+    assert (libs / "_clock.py").read_text(encoding="utf-8") == (
+        "def now():\n    return '9:44:22'\n"
+    )
+    assert (libs / "native.cpython-315-x86_64-linux-gnu.so").read_bytes() == b"prebuilt"
+    assert (libs / "nested" / "helper.py").read_text(encoding="utf-8") == "VALUE = 'nested'\n"
+    assert not (libs / "_clock.so").exists()
+    assert not (libs / "build").exists()
+    assert not (libs / "leftover.c").exists()
+
+    info = weld.packages()["clock"]
+    assert info["files"] == ["clock"]
+    assert info["_lib_files"] == [
+        "_clock.py",
+        "native.cpython-315-x86_64-linux-gnu.so",
+        "nested/helper.py",
+    ]
+    assert "libs" not in info
+
+    assert weld.ok("--run", "clock").stdout.strip() == "9:44:22"
+    assert "clock" in weld.ok("--verify").stdout
+
+    assert "clock" in weld.ok("--info", "clock").stdout
+    assert weld.libs_dir.name in weld.ok("--stats").stdout
+
+    weld.ok("--remove", "clock")
+    assert not (libs / "_clock.py").exists()
+    assert not (libs / "native.cpython-315-x86_64-linux-gnu.so").exists()
+    assert not (libs / "nested").exists()
+
+
+def test_install_copies_libs_without_declared_libs_compiler(
+    weld: WeldRunner,
+) -> None:
+    # An existing config that still requests Cython must not trigger a build.
+    weld.ok("--version")
+    weld.set_config(libs_compiler="cython")
+    archive = make_archive(
+        weld.root / "app.wld",
+        {"name": "app", "version": "1.0.0", "deps": [], "desc": ""},
+        {"bin/main.py": "print('hi')\n", "bin/libs/lib.py": "X = 1\n"},
+    )
+    result = weld.install(archive)
+    assert "Copying libs" in result.stdout
+    assert (weld.libs_dir / "lib.py").read_text(encoding="utf-8") == "X = 1\n"
+
+
+def test_update_replaces_changed_libs_and_keeps_untouched_ones(
+    weld: WeldRunner,
+) -> None:
+    first = make_archive(
+        weld.root / "clock.wld",
+        {"name": "clock", "version": "1.1.1", "deps": [], "desc": ""},
+        {
+            "bin/main.py": "print('clock')\n",
+            "bin/libs/_clock.py": "VALUE = 'old'\n",
+            "bin/libs/legacy.py": "VALUE = 'legacy'\n",
+        },
+    )
+    weld.install(first)
+    second = make_archive(
+        weld.root / "clock-2.wld",
+        {"name": "clock", "version": "1.1.2", "deps": [], "desc": ""},
+        {
+            "bin/main.py": "print('clock 2')\n",
+            "bin/libs/_clock.py": "VALUE = 'new'\n",
+        },
+    )
+    weld.ok("--update", str(second))
+
+    assert (weld.libs_dir / "_clock.py").read_text(encoding="utf-8") == "VALUE = 'new'\n"
+    assert not (weld.libs_dir / "legacy.py").exists()
+    assert weld.packages()["clock"]["_lib_files"] == ["_clock.py"]
+
+
+def test_remove_keeps_copied_libs_shared_with_another_package(
+    weld: WeldRunner,
+) -> None:
+    archive = make_archive(
+        weld.root / "shared.wld",
+        {"name": "one", "version": "1.0.0", "deps": [], "desc": ""},
+        {"bin/main.py": "print('one')\n", "bin/libs/shared.py": "VALUE = 1\n"},
+    )
+    weld.install(archive)
+    weld.ok("--duplicate", "one", "two")
+    weld.ok("--remove", "one")
+    assert (weld.libs_dir / "shared.py").is_file()
+    weld.ok("--remove", "two")
+    assert not (weld.libs_dir / "shared.py").exists()
+
+
+def test_addc_copies_installed_lib_files(weld: WeldRunner) -> None:
+    archive = make_archive(
+        weld.root / "clock.wld",
+        {"name": "clock", "version": "1.1.1", "deps": [], "desc": ""},
+        {"bin/main.py": "print('clock')\n", "bin/libs/_clock.py": "VALUE = 'clock'\n"},
+    )
+    weld.install(archive)
+
+    project = weld.new("consumer")
+    weld.ok("--addc", "clock", cwd=project)
+    assert (project / "bin" / "libs" / "_clock.py").read_text(encoding="utf-8") == (
+        "VALUE = 'clock'\n"
+    )
+
+
+def test_legacy_cython_install_is_removed_by_remove_and_clean(
+    weld: WeldRunner,
+) -> None:
+    weld.ok("--version")  # bootstrap ~/.weld
+    legacy = weld.libs_dir / "_clock.so"
+    legacy.write_bytes(b"old cython build")
+    weld.bin_dir.mkdir(parents=True, exist_ok=True)
+    (weld.bin_dir / "clock").write_text("#!/bin/sh\n", encoding="utf-8")
+    (weld.home / ".weld" / "packages.json").write_text(
+        json.dumps({
+            "clock": {
+                "deps": [], "version": "1.1.1", "desc": "", "files": ["clock"],
+                "libs": ["_clock"], "has_readme": False, "has_changelog": False,
+                "pinned": False, "note": "", "installed_at": "x", "updated_at": "x",
+            },
+            "other": {
+                "deps": [], "version": "1.0.0", "desc": "", "files": [],
+                "libs": [], "_lib_files": ["keep.py"],
+                "has_readme": False, "has_changelog": False,
+                "pinned": False, "note": "", "installed_at": "x", "updated_at": "x",
+            },
+        }),
+        encoding="utf-8",
+    )
+    keep = weld.libs_dir / "keep.py"
+    keep.write_text("VALUE = 1\n", encoding="utf-8")
+
+    assert "_clock" in weld.ok("--info", "clock").stdout
+    assert "keep.py" in weld.ok("--info", "other").stdout
+    assert "clock" in weld.ok("--search", "clock").stdout
+    assert "Total libs" in weld.ok("--stats").stdout
+
+    # The other package's copied library is not an orphan.
+    weld.ok("--clean", input="n\n")
+    assert keep.is_file()
+    assert legacy.is_file()
+
+    weld.ok("--remove", "clock")
+    assert not legacy.exists()
+    assert keep.is_file()
